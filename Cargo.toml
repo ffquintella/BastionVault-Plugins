@@ -16,3 +16,16 @@ authors = ["BastionVault contributors"]
 # repo is checked out as a submodule under `<host>/plugins-ext/`. For
 # standalone builds, set BASTION_PLUGIN_SDK_PATH or override [patch] in a
 # top-level workspace.
+
+# WASM-friendly release profile applied to every workspace member.
+# `panic = "abort"` skips unwind tables; `opt-level = "s"` favours size
+# over speed; `lto = true` lets the linker drop unused std symbols. The
+# postgres process plugin compiles native (not wasm) so the size knobs
+# apply to it too — that binary is shipped to operators and small is
+# better even for a server-side process.
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

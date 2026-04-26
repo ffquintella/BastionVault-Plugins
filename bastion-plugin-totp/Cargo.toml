@@ -25,11 +25,3 @@ serial_test = "3"
 # Passthrough so `cargo test --features host_test` exercises the
 # host-stub-backed handler tests in src/lib.rs.
 host_test = ["bastion-plugin-sdk/host_test"]
-
-[profile.release]
-# WASM-friendly: small + abort-on-panic so unwind tables aren't emitted.
-opt-level = "s"
-lto = true
-panic = "abort"
-codegen-units = 1
-strip = true
