@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "bastion-plugin-totp",
+    "bastion-plugin-postgres",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ffquintella/BastionVault-Plugins"
+authors = ["BastionVault contributors"]
+
+# Reference plugins for BastionVault. See features/plugin-system.md (Phase 4)
+# in the host repo. The SDK is consumed via a relative path because this
+# repo is checked out as a submodule under `<host>/plugins-ext/`. For
+# standalone builds, set BASTION_PLUGIN_SDK_PATH or override [patch] in a
+# top-level workspace.

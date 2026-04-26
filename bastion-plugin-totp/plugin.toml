@@ -1,0 +1,53 @@
+# BastionVault plugin manifest. Operators upload this alongside the
+# .wasm binary via `POST /v1/sys/plugins/<name>` (multipart) or via the
+# Plugins page in the GUI.
+
+name        = "totp"
+version     = "0.1.0"
+plugin_type = "secret"
+runtime     = "wasm"
+abi_version = "1.0"
+
+# Filled in by the host on registration: the catalog computes sha256
+# over the uploaded binary and rejects any tampering. The placeholder
+# here is for documentation only.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "RFC 6238 TOTP code generator and validator. Time source from bv.now_unix_ms."
+
+# This plugin needs no storage and no audit channel — it's a pure
+# compute capsule that takes (secret, operation, [code]) on stdin and
+# returns either a fresh code or a validation result. The host time is
+# the only capability it asks for, and `now_unix_ms` is always
+# available (not capability-gated).
+[capabilities]
+log_emit  = true
+audit_emit = false
+
+# Operator-tunable knobs. The host renders these in the Configure
+# modal for the plugin; the plugin reads them via bv.config_get at run
+# time. `digits` and `period` follow RFC 6238 defaults.
+[[config_schema]]
+name        = "digits"
+label       = "Digits"
+description = "Number of decimal digits in the generated code (RFC 6238 default 6)."
+kind        = "int"
+required    = false
+default     = "6"
+
+[[config_schema]]
+name        = "period"
+label       = "Period (seconds)"
+description = "Time step in seconds between code rotations (RFC 6238 default 30)."
+kind        = "int"
+required    = false
+default     = "30"
+
+[[config_schema]]
+name        = "skew"
+label       = "Validation skew (steps)"
+description = "Number of past/future steps accepted on validate (default 1 → ±30s window)."
+kind        = "int"
+required    = false
+default     = "1"

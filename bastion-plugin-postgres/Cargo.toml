@@ -1,0 +1,33 @@
+[package]
+name = "bastion-plugin-postgres"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reference Postgres dynamic-credential plugin for BastionVault. Process runtime."
+
+[[bin]]
+name = "bastion-plugin-postgres"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+# tokio-postgres without the TLS feature keeps the dep tree small and
+# avoids pulling in rustls / openssl-sys. Operators who need TLS to the
+# database wire it in via stunnel / a sidecar / the future
+# `make_tls_connector` capability.
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

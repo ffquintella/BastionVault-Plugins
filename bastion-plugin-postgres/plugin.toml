@@ -1,0 +1,56 @@
+name        = "postgres"
+version     = "0.1.0"
+plugin_type = "database"
+runtime     = "process"
+abi_version = "1.0"
+
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "Postgres dynamic-credential plugin. Issues short-lived role-bound logins on demand."
+
+[capabilities]
+# The plugin needs to log connection failures and emit audit events
+# when a credential is created or revoked. It does not need storage —
+# all of its state (per-credential metadata) is round-tripped through
+# the host's lease manager via the response payload.
+log_emit   = true
+audit_emit = true
+# Declarative-only in v1: the host doesn't enforce egress at the OS
+# level (see features/plugin-system.md → Phase 2). Operators who need
+# hard egress filtering wrap BastionVault under systemd / k8s / Docker.
+allowed_hosts = ["*"]
+
+# Operators set the connection string + role policy via the Configure
+# modal. Connection string is treated as a secret so it doesn't echo
+# back in the GUI on read.
+[[config_schema]]
+name        = "connection_string"
+label       = "Connection string"
+description = "libpq-style connection string used to connect as the management role. e.g. host=db user=vault dbname=postgres"
+kind        = "secret"
+required    = true
+
+[[config_schema]]
+name        = "ttl_seconds"
+label       = "Credential TTL (seconds)"
+description = "Default validity for issued credentials. The plugin sets a matching VALID UNTIL on the role."
+kind        = "int"
+required    = false
+default     = "3600"
+
+[[config_schema]]
+name        = "role_prefix"
+label       = "Role prefix"
+description = "Issued role names start with this prefix so audit + revocation can identify managed users."
+kind        = "string"
+required    = false
+default     = "bv-"
+
+[[config_schema]]
+name        = "grants"
+label       = "Grants statement"
+description = "SQL granted to the issued role. Use {{name}} as the placeholder for the role name."
+kind        = "string"
+required    = false
+default     = "GRANT CONNECT ON DATABASE postgres TO \"{{name}}\";"
