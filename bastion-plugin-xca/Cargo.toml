@@ -1,0 +1,43 @@
+[package]
+name = "bastion-plugin-xca"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "XCA database (.xdb) importer plugin for BastionVault. Process runtime."
+
+[[bin]]
+name = "bastion-plugin-xca"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+# `bundled` ships SQLite alongside the plugin so operators don't need
+# a system libsqlite3 — same trade-off the host's hiqlite backend
+# already makes for the embedded Raft store. Keeps the plugin binary
+# self-contained at the cost of ~2 MiB.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# AES-256-CBC drives both XCA encryption envelopes (EVP_BytesToKey
+# pre-2.0 and PBKDF2 post-2.4). `cbc` exposes the block-mode wrapper.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+# MD5 + 1-iteration EVP_BytesToKey for the legacy XCA envelope.
+md-5 = "0.10"
+# PBKDF2-HMAC-SHA512 for the modern XCA envelope. SHA-256 is also used
+# inside XCA for its database-password integrity hash.
+pbkdf2 = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+# Cert / CSR / CRL parsing — extracts subject, serial, validity for
+# the `preview` summary. `x509-parser` is the lighter ecosystem;
+# we only read fields, never construct.
+x509-parser = "0.16"
+# Hex for cert serial display.
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }

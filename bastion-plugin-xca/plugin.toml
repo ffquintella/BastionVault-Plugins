@@ -1,0 +1,28 @@
+name        = "xca-import"
+version     = "0.1.0"
+plugin_type = "tool"
+runtime     = "process"
+abi_version = "1.0"
+
+# Filled in by `bv-plugin-pack` at pack time.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "XCA database (.xdb) importer. Reads + decrypts XCA SQLite files; returns a structured plan the GUI walks via existing PKI / KV routes."
+
+[capabilities]
+# The plugin reads files supplied by the operator (the .xdb path or
+# inline base64) and decrypts blobs with passwords also supplied by
+# the operator. It does not need storage, audit, crypto, or network
+# capabilities — the host's GUI applies the returned plan via the
+# regular PKI / KV route surface, where existing policy + audit
+# enforcement runs.
+log_emit   = true
+audit_emit = false
+# Declarative-only — the plugin only ever connects to nothing.
+allowed_hosts = []
+
+# No operator config in v1: every parameter (file path, password,
+# per-key passwords, options) flows in via the invoke `data` map
+# from the GUI per call. Configurable defaults can land in a later
+# phase if operator demand emerges.

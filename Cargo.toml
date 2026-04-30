@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "bastion-plugin-totp",
     "bastion-plugin-postgres",
+    "bastion-plugin-xca",
 ]
 
 [workspace.package]
