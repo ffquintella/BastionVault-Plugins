@@ -272,6 +272,22 @@ pub fn preview(
     })
 }
 
+/// Return the first candidate column name that exists on `table`, or
+/// `None` if none do. Uses `PRAGMA table_info` so we don't have to
+/// keep up with every XCA schema bump.
+fn pick_column(conn: &Connection, table: &str, candidates: &[&'static str]) -> Option<&'static str> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql).ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    let mut cols: Vec<String> = Vec::new();
+    while let Ok(Some(r)) = rows.next() {
+        if let Ok(name) = r.get::<_, String>(1) {
+            cols.push(name);
+        }
+    }
+    candidates.iter().copied().find(|c| cols.iter().any(|n| n.eq_ignore_ascii_case(c)))
+}
+
 fn open_readonly(path: &Path) -> Result<Connection, OpenError> {
     Connection::open_with_flags(
         path,
@@ -322,8 +338,15 @@ fn scan_ownpass_keys(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 }
 
 fn read_items(conn: &Connection) -> Result<Vec<ItemMeta>, OpenError> {
+    // XCA renamed the parent-id column from `parent` to `pid` somewhere
+    // around the 2.x line. Probe the schema and pick whichever exists;
+    // fall back to NULL so the query at least runs on exotic forks.
+    let parent_expr = pick_column(conn, "items", &["pid", "parent"]).unwrap_or("NULL");
+    let sql = format!(
+        "SELECT id, type, {parent_expr} AS parent, name, comment FROM items ORDER BY id ASC"
+    );
     let mut stmt = conn
-        .prepare("SELECT id, type, parent, name, comment FROM items ORDER BY id ASC")
+        .prepare(&sql)
         .map_err(|e| OpenError(format!("prepare items: {e}")))?;
     let mut rows = stmt
         .query([])
