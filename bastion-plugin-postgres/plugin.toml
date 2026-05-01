@@ -1,5 +1,5 @@
 name        = "postgres"
-version     = "0.1.0"
+version     = "0.1.2"
 plugin_type = "database"
 runtime     = "process"
 abi_version = "1.0"

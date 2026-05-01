@@ -7,11 +7,56 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use base64::Engine as _;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use x509_parser::prelude::*;
 
 use crate::crypto;
+
+/// XCA stores DER blobs (certs, CSRs, CRLs, templates, keys, encrypted
+/// private blobs) as base64 ASCII inside `VARCHAR` columns rather than
+/// as raw `BLOB`. Read the column as text, strip any whitespace XCA may
+/// have emitted, and decode. If the value somehow already arrives as a
+/// blob (older XCA forks did this), fall back to the raw bytes.
+fn read_xca_blob_column(
+    conn: &Connection,
+    sql: &str,
+    item_id: i64,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    let raw = match conn.query_row(sql, [item_id], |r| {
+        r.get::<_, rusqlite::types::Value>(0)
+    }) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let bytes = match raw {
+        rusqlite::types::Value::Text(s) => decode_xca_b64(&s),
+        rusqlite::types::Value::Blob(b) => b,
+        rusqlite::types::Value::Null => return Ok(None),
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unexpected XCA blob column type: {other:?}"),
+                )),
+            ))
+        }
+    };
+    Ok(Some(bytes))
+}
+
+fn decode_xca_b64(s: &str) -> Vec<u8> {
+    // XCA emits a single line of standard base64. Be lenient against
+    // wrapped lines / stray whitespace just in case.
+    let trimmed: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(trimmed.as_bytes())
+        .unwrap_or_else(|_| s.as_bytes().to_vec())
+}
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -183,8 +228,8 @@ pub fn preview(
 
     for meta in item_rows {
         match meta.item_type {
-            ItemType::Cert => {
-                if let Ok(Some(item)) = read_cert_item(&conn, &meta) {
+            ItemType::Cert => match read_cert_item(&conn, &meta) {
+                Ok(Some(item)) => {
                     if item.is_ca {
                         summary.issuer_count += 1;
                     } else {
@@ -192,7 +237,9 @@ pub fn preview(
                     }
                     items.push(item.into_preview(meta));
                 }
-            }
+                Ok(None) => skipped.push(format!("cert-row-missing:{}", meta.name)),
+                Err(e) => skipped.push(format!("cert-row-error:{}: {e}", meta.name)),
+            },
             ItemType::Request => {
                 summary.csr_count += 1;
                 if let Ok(Some(p)) = read_request_item(&conn, &meta) {
@@ -320,7 +367,12 @@ fn scan_requires_password(conn: &Connection) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare("SELECT private FROM private_keys WHERE private IS NOT NULL")?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
-        let blob: Vec<u8> = r.get(0)?;
+        let val: rusqlite::types::Value = r.get(0)?;
+        let blob = match val {
+            rusqlite::types::Value::Text(s) => decode_xca_b64(&s),
+            rusqlite::types::Value::Blob(b) => b,
+            _ => continue,
+        };
         if crypto::detect_format(&blob).is_some() {
             return Ok(true);
         }
@@ -404,28 +456,47 @@ impl CertRow {
     }
 }
 
+/// Pull the cert blob from whichever column name this XCA build uses,
+/// then derive `is_ca` from the certificate's own BasicConstraints
+/// extension. Earlier code keyed off a `certs.ca` column that doesn't
+/// exist in every schema version, which silently dropped every cert.
 fn read_cert_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Option<CertRow>> {
-    let row: Option<(Vec<u8>, i64)> = conn
-        .query_row(
-            "SELECT cert, ca FROM certs WHERE item = ?1",
-            [meta.id],
-            |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
-        )
-        .ok();
-    Ok(row.map(|(der, ca)| CertRow {
-        der,
-        is_ca: ca != 0,
-    }))
+    let col = pick_column(conn, "certs", &["cert", "der"]).unwrap_or("cert");
+    // Pull `ca` separately so we can fall back to BasicConstraints when
+    // the column is absent. Schema 8 has it; some older forks don't.
+    let has_ca_col = pick_column(conn, "certs", &["ca"]).is_some();
+    let der_sql = format!("SELECT {col} FROM certs WHERE item = ?1");
+    let der = match read_xca_blob_column(conn, &der_sql, meta.id)? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let ca_flag: Option<i64> = if has_ca_col {
+        conn.query_row("SELECT ca FROM certs WHERE item = ?1", [meta.id], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let is_ca = ca_flag.map(|v| v != 0).unwrap_or_else(|| is_ca_cert(&der));
+    Ok(Some(CertRow { der, is_ca }))
+}
+
+fn is_ca_cert(der: &[u8]) -> bool {
+    let Ok((_, cert)) = X509Certificate::from_der(der) else {
+        return false;
+    };
+    match cert.basic_constraints() {
+        Ok(Some(bc)) => bc.value.ca,
+        _ => false,
+    }
 }
 
 fn read_request_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Option<PreviewItem>> {
-    let row: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT request FROM requests WHERE item = ?1",
-            [meta.id],
-            |r| r.get(0),
-        )
-        .ok();
+    let col = pick_column(conn, "requests", &["request", "csr", "der"]).unwrap_or("request");
+    let sql = format!("SELECT {col} FROM requests WHERE item = ?1");
+    let row = read_xca_blob_column(conn, &sql, meta.id)?;
     Ok(row.map(|der| {
         let mut subject = String::new();
         if let Ok((_, csr)) = X509CertificationRequest::from_der(&der) {
@@ -450,11 +521,9 @@ fn read_request_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Opt
 }
 
 fn read_crl_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Option<PreviewItem>> {
-    let row: Option<Vec<u8>> = conn
-        .query_row("SELECT crl FROM crls WHERE item = ?1", [meta.id], |r| {
-            r.get(0)
-        })
-        .ok();
+    let col = pick_column(conn, "crls", &["crl", "der"]).unwrap_or("crl");
+    let sql = format!("SELECT {col} FROM crls WHERE item = ?1");
+    let row = read_xca_blob_column(conn, &sql, meta.id)?;
     Ok(row.map(|der| PreviewItem {
         pem: Some(pem_wrap("X509 CRL", &der)),
         subject: String::new(),
@@ -476,13 +545,9 @@ fn read_template_item(
     conn: &Connection,
     meta: &ItemMeta,
 ) -> rusqlite::Result<Option<PreviewItem>> {
-    let row: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT template FROM templates WHERE item = ?1",
-            [meta.id],
-            |r| r.get(0),
-        )
-        .ok();
+    let col = pick_column(conn, "templates", &["template", "data"]).unwrap_or("template");
+    let sql = format!("SELECT {col} FROM templates WHERE item = ?1");
+    let row = read_xca_blob_column(conn, &sql, meta.id)?;
     // Templates are XCA's internal blob format; we round-trip them
     // base64-tagged inside the PEM body so the operator can re-import
     // them later or hand-translate to a `pki/role`.
@@ -507,13 +572,9 @@ fn read_public_key_item(
     conn: &Connection,
     meta: &ItemMeta,
 ) -> rusqlite::Result<Option<PreviewItem>> {
-    let row: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT key FROM public_keys WHERE item = ?1",
-            [meta.id],
-            |r| r.get(0),
-        )
-        .ok();
+    let col = pick_column(conn, "public_keys", &["key", "public", "der"]).unwrap_or("key");
+    let sql = format!("SELECT {col} FROM public_keys WHERE item = ?1");
+    let row = read_xca_blob_column(conn, &sql, meta.id)?;
     Ok(row.map(|der| PreviewItem {
         pem: Some(pem_wrap("PUBLIC KEY", &der)),
         subject: String::new(),
@@ -535,14 +596,24 @@ fn read_private_key_row(
     conn: &Connection,
     meta: &ItemMeta,
 ) -> rusqlite::Result<Option<(Vec<u8>, bool)>> {
-    let row: Option<(Vec<u8>, Option<String>)> = conn
+    let blob = match read_xca_blob_column(
+        conn,
+        "SELECT private FROM private_keys WHERE item = ?1",
+        meta.id,
+    )? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let own_pass: Option<String> = conn
         .query_row(
-            "SELECT private, ownPass FROM private_keys WHERE item = ?1",
+            "SELECT ownPass FROM private_keys WHERE item = ?1",
             [meta.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get::<_, Option<String>>(0),
         )
-        .ok();
-    Ok(row.map(|(blob, op)| (blob, op.map(|s| !s.is_empty()).unwrap_or(false))))
+        .ok()
+        .flatten();
+    let has_own_pass = own_pass.map(|s| !s.is_empty()).unwrap_or(false);
+    Ok(Some((blob, has_own_pass)))
 }
 
 fn try_decrypt_key(blob: &[u8], password: Option<&str>) -> Result<(Option<String>, DecryptStatus), String> {
