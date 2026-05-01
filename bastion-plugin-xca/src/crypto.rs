@@ -21,7 +21,8 @@ use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use hmac::Hmac;
 use md5::{Digest as Md5Digest, Md5};
 use pbkdf2::pbkdf2;
-use sha2::Sha512;
+use sha1::Sha1;
+use sha2::{Sha224, Sha256, Sha384, Sha512};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
@@ -77,33 +78,43 @@ pub fn decrypt_legacy(blob: &[u8], password: &str) -> Result<Vec<u8>, DecryptErr
         .map_err(|_| DecryptError("decrypt failed (wrong password or corrupt blob)".into()))
 }
 
-/// Decrypt an XCA PBKDF2 envelope. The header layout XCA writes is an
-/// ASN.1 SEQUENCE — but rather than dragging in an ASN.1 parser for
-/// the handful of fields we need, we walk the TLV structure directly.
+/// Decrypt an XCA PBKDF2 envelope. XCA writes its encrypted private
+/// keys as a standard PKCS#8 `EncryptedPrivateKeyInfo` (RFC 5208)
+/// using PBES2 (RFC 8018) with PBKDF2 + AES-256-CBC. We walk the
+/// TLV structure directly rather than pulling in a full ASN.1 parser.
 ///
 /// Layout (DER):
 ///
 /// ```text
-/// SEQUENCE {
-///   SEQUENCE {                       -- KDF parameters
-///     OBJECT IDENTIFIER pbkdf2 (1.2.840.113549.1.5.12)
-///     SEQUENCE {
-///       OCTET STRING salt
-///       INTEGER iteration_count
-///       INTEGER key_length            -- optional, sometimes omitted
-///       SEQUENCE {                    -- prf
-///         OBJECT IDENTIFIER hmacWithSHA512 (1.2.840.113549.2.11)
-///         NULL
+/// SEQUENCE {                              -- EncryptedPrivateKeyInfo
+///   SEQUENCE {                            -- AlgorithmIdentifier
+///     OBJECT IDENTIFIER pbes2 (1.2.840.113549.1.5.13)
+///     SEQUENCE {                          -- PBES2-params
+///       SEQUENCE {                        -- keyDerivationFunc
+///         OBJECT IDENTIFIER pbkdf2 (1.2.840.113549.1.5.12)
+///         SEQUENCE {                      -- PBKDF2-params
+///           OCTET STRING salt
+///           INTEGER iteration_count
+///           INTEGER key_length             -- optional
+///           SEQUENCE {                     -- optional prf
+///             OBJECT IDENTIFIER hmacWithSHA*
+///             NULL
+///           }
+///         }
+///       }
+///       SEQUENCE {                        -- encryptionScheme
+///         OBJECT IDENTIFIER aes-256-cbc (2.16.840.1.101.3.4.1.42)
+///         OCTET STRING iv
 ///       }
 ///     }
 ///   }
-///   SEQUENCE {                       -- cipher
-///     OBJECT IDENTIFIER aes-256-cbc (2.16.840.1.101.3.4.1.42)
-///     OCTET STRING iv
-///   }
-///   OCTET STRING ciphertext
+///   OCTET STRING encryptedData
 /// }
 /// ```
+///
+/// Older XCA forks (and a few other tools) sometimes emit a
+/// "shorthand" form where the outer SEQUENCE skips the PBES2 wrapper
+/// and starts with the KDF SEQUENCE directly. We accept that too.
 pub fn decrypt_pbkdf2(blob: &[u8], password: &str) -> Result<Vec<u8>, DecryptError> {
     let parsed = parse_pbkdf2_envelope(blob)
         .ok_or_else(|| DecryptError("malformed PBKDF2 envelope".into()))?;
@@ -114,8 +125,17 @@ pub fn decrypt_pbkdf2(blob: &[u8], password: &str) -> Result<Vec<u8>, DecryptErr
         )));
     }
     let mut key = [0u8; 32];
-    pbkdf2::<Hmac<Sha512>>(password.as_bytes(), &parsed.salt, parsed.iter, &mut key)
-        .map_err(|e| DecryptError(format!("PBKDF2 derive failed: {e}")))?;
+    let pw = password.as_bytes();
+    let salt = &parsed.salt;
+    let iter = parsed.iter;
+    let res = match parsed.prf {
+        Prf::Sha1 => pbkdf2::<Hmac<Sha1>>(pw, salt, iter, &mut key),
+        Prf::Sha224 => pbkdf2::<Hmac<Sha224>>(pw, salt, iter, &mut key),
+        Prf::Sha256 => pbkdf2::<Hmac<Sha256>>(pw, salt, iter, &mut key),
+        Prf::Sha384 => pbkdf2::<Hmac<Sha384>>(pw, salt, iter, &mut key),
+        Prf::Sha512 => pbkdf2::<Hmac<Sha512>>(pw, salt, iter, &mut key),
+    };
+    res.map_err(|e| DecryptError(format!("PBKDF2 derive failed: {e}")))?;
     if parsed.iv.len() != 16 {
         return Err(DecryptError(format!(
             "unsupported IV length {}",
@@ -177,56 +197,115 @@ struct Pbkdf2Header<'a> {
     salt: Vec<u8>,
     iter: u32,
     key_length: usize,
+    prf: Prf,
     iv: Vec<u8>,
     ciphertext: &'a [u8],
 }
 
+// OIDs we care about, in DER content-octet form.
+const OID_PBES2: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0D];
+const OID_PBKDF2: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0C];
+const OID_AES_256_CBC: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A];
+const OID_AES_128_CBC: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x02];
+const OID_AES_192_CBC: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x16];
+// hmacWithSHA1/224/256/384/512 — 1.2.840.113549.2.{7,8,9,10,11}
+const OID_HMAC_SHA1: [u8; 8] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x07];
+const OID_HMAC_SHA224: [u8; 8] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x08];
+const OID_HMAC_SHA256: [u8; 8] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x09];
+const OID_HMAC_SHA384: [u8; 8] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x0A];
+const OID_HMAC_SHA512: [u8; 8] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x0B];
+
+#[derive(Debug, Clone, Copy)]
+enum Prf {
+    Sha1,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
 fn parse_pbkdf2_envelope(blob: &[u8]) -> Option<Pbkdf2Header<'_>> {
-    // Outer SEQUENCE
+    // Outer SEQUENCE — could be EncryptedPrivateKeyInfo (PKCS#8 PBES2)
+    // or a shorthand PBES2-params + ciphertext form.
     let (outer, _rest) = der_sequence(blob)?;
-    // KDF SEQUENCE
-    let (kdf, after_kdf) = der_sequence(outer)?;
-    let (kdf_oid, kdf_params_outer) = der_oid(kdf)?;
-    if kdf_oid != [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0C] {
-        // 1.2.840.113549.1.5.12 = pbkdf2
+    let (first_seq, after_first) = der_sequence(outer)?;
+
+    // PKCS#8 form: first SEQUENCE is AlgorithmIdentifier with PBES2 OID,
+    // then OCTET STRING ciphertext. Shorthand form: first SEQUENCE is
+    // the KDF (with PBKDF2 OID), then cipher SEQUENCE, then ciphertext.
+    let (alg_oid, after_alg_oid) = der_oid(first_seq)?;
+    let (kdf_seq, cipher_seq, ciphertext) = if alg_oid == OID_PBES2 {
+        let (pbes2_params, _) = der_sequence(after_alg_oid)?;
+        let (kdf, after_kdf) = der_sequence(pbes2_params)?;
+        let (cipher, _) = der_sequence(after_kdf)?;
+        let (ct, _) = der_octet_string(after_first)?;
+        (kdf, cipher, ct)
+    } else if alg_oid == OID_PBKDF2 {
+        let (cipher, after_cipher) = der_sequence(after_first)?;
+        let (ct, _) = der_octet_string(after_cipher)?;
+        (first_seq, cipher, ct)
+    } else {
+        return None;
+    };
+
+    // KDF SEQUENCE: { OID pbkdf2, SEQUENCE PBKDF2-params }
+    let (kdf_oid, kdf_params_outer) = der_oid(kdf_seq)?;
+    if kdf_oid != OID_PBKDF2 {
         return None;
     }
-    // KDF inner SEQUENCE
     let (kdf_params, _) = der_sequence(kdf_params_outer)?;
     let (salt, after_salt) = der_octet_string(kdf_params)?;
     let (iter_bytes, after_iter) = der_integer(after_salt)?;
     let iter = be_uint_to_u32(iter_bytes)?;
-    // Optional INTEGER (key_length) before the PRF SEQUENCE.
-    let (key_length, prf_outer) = match peek_tag(after_iter) {
+    // Optional INTEGER key_length before optional PRF SEQUENCE.
+    let (key_length_opt, after_kl) = match peek_tag(after_iter) {
         Some(0x02) => {
             let (kl_bytes, rest) = der_integer(after_iter)?;
-            (be_uint_to_u32(kl_bytes)? as usize, rest)
+            (Some(be_uint_to_u32(kl_bytes)? as usize), rest)
         }
-        _ => (32usize, after_iter),
+        _ => (None, after_iter),
     };
-    // PRF SEQUENCE — accept hmacWithSHA512 only (XCA's choice).
-    let (prf, _) = der_sequence(prf_outer)?;
-    let (prf_oid, _) = der_oid(prf)?;
-    if prf_oid != [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x0B] {
-        // 1.2.840.113549.2.11 = hmacWithSHA512
-        return None;
-    }
+    // Optional PRF SEQUENCE — defaults to hmacWithSHA1 (RFC 8018).
+    let prf = match peek_tag(after_kl) {
+        Some(0x30) => {
+            let (prf_seq, _) = der_sequence(after_kl)?;
+            let (prf_oid, _) = der_oid(prf_seq)?;
+            if prf_oid == OID_HMAC_SHA512 {
+                Prf::Sha512
+            } else if prf_oid == OID_HMAC_SHA256 {
+                Prf::Sha256
+            } else if prf_oid == OID_HMAC_SHA384 {
+                Prf::Sha384
+            } else if prf_oid == OID_HMAC_SHA224 {
+                Prf::Sha224
+            } else if prf_oid == OID_HMAC_SHA1 {
+                Prf::Sha1
+            } else {
+                return None;
+            }
+        }
+        _ => Prf::Sha1,
+    };
 
-    // Cipher SEQUENCE
-    let (cipher, after_cipher) = der_sequence(after_kdf)?;
-    let (cipher_oid, iv_outer) = der_oid(cipher)?;
-    if cipher_oid != [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A] {
-        // 2.16.840.1.101.3.4.1.42 = aes-256-cbc
+    // Cipher SEQUENCE: { OID aes-*-cbc, OCTET STRING iv }
+    let (cipher_oid, iv_outer) = der_oid(cipher_seq)?;
+    let cipher_key_length = if cipher_oid == OID_AES_256_CBC {
+        32usize
+    } else if cipher_oid == OID_AES_192_CBC {
+        24usize
+    } else if cipher_oid == OID_AES_128_CBC {
+        16usize
+    } else {
         return None;
-    }
+    };
     let (iv, _) = der_octet_string(iv_outer)?;
-    // Ciphertext OCTET STRING
-    let (ciphertext, _) = der_octet_string(after_cipher)?;
+    let key_length = key_length_opt.unwrap_or(cipher_key_length);
 
     Some(Pbkdf2Header {
         salt: salt.to_vec(),
         iter,
         key_length,
+        prf,
         iv: iv.to_vec(),
         ciphertext,
     })

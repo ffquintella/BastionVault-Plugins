@@ -1,6 +1,6 @@
 [package]
 name = "bastion-plugin-xca"
-version = "0.1.2"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -31,6 +31,7 @@ md-5 = "0.10"
 # inside XCA for its database-password integrity hash.
 pbkdf2 = "0.12"
 hmac = "0.12"
+sha1 = "0.10"
 sha2 = "0.10"
 # Cert / CSR / CRL parsing — extracts subject, serial, validity for
 # the `preview` summary. `x509-parser` is the lighter ecosystem;
