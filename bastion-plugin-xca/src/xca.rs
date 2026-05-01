@@ -28,10 +28,15 @@ pub enum ItemType {
 
 impl ItemType {
     fn from_xca(code: i64) -> Self {
+        // Modern XCA pkitype enum (schema >= 8): asym_key=1, x509req=2,
+        // x509=3, crl=4, tmpl=5. Earlier internal docs of this plugin had
+        // 2/3 swapped; the live schema-8 file the user shipped proved the
+        // ordering above. 6/7 are reserved for codes XCA hasn't shipped on
+        // disk; we map them defensively but never index off them.
         match code {
             1 => ItemType::PrivateKey,
-            2 => ItemType::Cert,
-            3 => ItemType::Request,
+            2 => ItemType::Request,
+            3 => ItemType::Cert,
             4 => ItemType::Crl,
             5 => ItemType::Template,
             6 => ItemType::PublicKey,
