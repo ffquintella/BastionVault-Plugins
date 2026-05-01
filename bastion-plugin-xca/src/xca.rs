@@ -143,6 +143,12 @@ pub struct PreviewItem {
     /// counterpart exists in the file).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paired_item_id: Option<i64>,
+    /// For certs only: true when the cert is a CA (BasicConstraints
+    /// `cA=true` or XCA's `certs.ca` flag). Lets the GUI route CA
+    /// certs to the issuer-import path and skip leaf certs (which
+    /// the host's PKI engine can't accept via `config/ca`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_ca: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +308,7 @@ pub fn preview(
                                     decrypt: status,
                                     has_own_pass,
                                     paired_item_id: None,
+                                    is_ca: false,
                                     meta,
                                 });
                             }
@@ -318,6 +325,7 @@ pub fn preview(
                                     decrypt: classify_failure(&reason),
                                     has_own_pass,
                                     paired_item_id: None,
+                                    is_ca: false,
                                     meta,
                                 });
                             }
@@ -505,6 +513,7 @@ impl CertRow {
             decrypt: DecryptStatus::NotEncrypted,
             has_own_pass: false,
             paired_item_id: None,
+            is_ca: self.is_ca,
             meta,
         }
     }
@@ -564,6 +573,7 @@ fn read_request_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Opt
             decrypt: DecryptStatus::NotEncrypted,
             has_own_pass: false,
             paired_item_id: None,
+            is_ca: false,
             meta: ItemMeta {
                 id: meta.id,
                 item_type: meta.item_type,
@@ -587,6 +597,7 @@ fn read_crl_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Option<
         decrypt: DecryptStatus::NotEncrypted,
         has_own_pass: false,
         paired_item_id: None,
+        is_ca: false,
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
@@ -615,6 +626,7 @@ fn read_template_item(
         decrypt: DecryptStatus::NotEncrypted,
         has_own_pass: false,
         paired_item_id: None,
+        is_ca: false,
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
@@ -640,6 +652,7 @@ fn read_public_key_item(
         decrypt: DecryptStatus::NotEncrypted,
         has_own_pass: false,
         paired_item_id: None,
+        is_ca: false,
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
