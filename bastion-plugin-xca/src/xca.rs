@@ -13,6 +13,7 @@ use serde::Serialize;
 use x509_parser::prelude::*;
 
 use crate::crypto;
+use crate::keymatch::{self, KeyFingerprint};
 
 /// XCA stores DER blobs (certs, CSRs, CRLs, templates, keys, encrypted
 /// private blobs) as base64 ASCII inside `VARCHAR` columns rather than
@@ -135,6 +136,13 @@ pub struct PreviewItem {
     pub decrypt: DecryptStatus,
     /// True when `private_keys.ownPass` was non-empty for this row.
     pub has_own_pass: bool,
+    /// `items.id` of the paired counterpart, when the plugin matched
+    /// a cert with its private key (or vice versa) by public-key
+    /// fingerprint. `None` when no match was possible (algorithm
+    /// without an extractable public key, decryption failed, no
+    /// counterpart exists in the file).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_item_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +223,12 @@ pub fn preview(
     let mut decryption_failures: Vec<DecryptionFailure> = Vec::new();
     let mut ownpass_keys: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    // Public-key fingerprints, keyed by `items.id`. We compute one
+    // for every cert (from its SPKI) and every successfully-decrypted
+    // private key (from its PKCS#8). Cert↔key pairs are then resolved
+    // by equal fingerprint after the per-row pass.
+    let mut cert_fingerprints: BTreeMap<i64, KeyFingerprint> = BTreeMap::new();
+    let mut key_fingerprints: BTreeMap<i64, KeyFingerprint> = BTreeMap::new();
     let mut summary = PreviewSummary {
         format_version: format_version.clone(),
         issuer_count: 0,
@@ -234,6 +248,9 @@ pub fn preview(
                         summary.issuer_count += 1;
                     } else {
                         summary.leaf_count += 1;
+                    }
+                    if let Some(fp) = keymatch::fingerprint_cert(&item.der) {
+                        cert_fingerprints.insert(meta.id, fp);
                     }
                     items.push(item.into_preview(meta));
                 }
@@ -271,15 +288,23 @@ pub fn preview(
                             .map(|s| s.as_str())
                             .or(master_password);
                         match try_decrypt_key(&blob, pw) {
-                            Ok((pem, status)) => items.push(PreviewItem {
-                                pem: pem,
-                                subject: String::new(),
-                                serial_hex: String::new(),
-                                not_after_unix: None,
-                                decrypt: status,
-                                has_own_pass,
-                                meta,
-                            }),
+                            Ok((pem, der_opt, status)) => {
+                                if let Some(der) = der_opt.as_deref() {
+                                    if let Some(fp) = keymatch::fingerprint_private_key(der) {
+                                        key_fingerprints.insert(meta.id, fp);
+                                    }
+                                }
+                                items.push(PreviewItem {
+                                    pem,
+                                    subject: String::new(),
+                                    serial_hex: String::new(),
+                                    not_after_unix: None,
+                                    decrypt: status,
+                                    has_own_pass,
+                                    paired_item_id: None,
+                                    meta,
+                                });
+                            }
                             Err(reason) => {
                                 decryption_failures.push(DecryptionFailure {
                                     name: meta.name.clone(),
@@ -292,6 +317,7 @@ pub fn preview(
                                     not_after_unix: None,
                                     decrypt: classify_failure(&reason),
                                     has_own_pass,
+                                    paired_item_id: None,
                                     meta,
                                 });
                             }
@@ -313,6 +339,33 @@ pub fn preview(
                 skipped.push(format!("unknown-type:{}", meta.name));
             }
         }
+    }
+
+    // Pair certs with private keys by public-key fingerprint. XCA
+    // doesn't store an explicit cert↔key linkage column, so we rely
+    // on the same property XCA itself uses at runtime: matching
+    // public keys. A cert and a key share a `paired_item_id` when
+    // their fingerprints are equal. If multiple keys collide on the
+    // same fingerprint (rare — would mean duplicated key material),
+    // the first one wins on each side.
+    let mut fp_to_cert: BTreeMap<KeyFingerprint, i64> = BTreeMap::new();
+    for (id, fp) in &cert_fingerprints {
+        fp_to_cert.entry(*fp).or_insert(*id);
+    }
+    let mut fp_to_key: BTreeMap<KeyFingerprint, i64> = BTreeMap::new();
+    for (id, fp) in &key_fingerprints {
+        fp_to_key.entry(*fp).or_insert(*id);
+    }
+    for item in &mut items {
+        item.paired_item_id = match item.meta.item_type {
+            ItemType::Cert => cert_fingerprints
+                .get(&item.meta.id)
+                .and_then(|fp| fp_to_key.get(fp).copied()),
+            ItemType::PrivateKey => key_fingerprints
+                .get(&item.meta.id)
+                .and_then(|fp| fp_to_cert.get(fp).copied()),
+            _ => None,
+        };
     }
 
     summary.skipped = skipped;
@@ -451,6 +504,7 @@ impl CertRow {
             not_after_unix,
             decrypt: DecryptStatus::NotEncrypted,
             has_own_pass: false,
+            paired_item_id: None,
             meta,
         }
     }
@@ -509,6 +563,7 @@ fn read_request_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Opt
             not_after_unix: None,
             decrypt: DecryptStatus::NotEncrypted,
             has_own_pass: false,
+            paired_item_id: None,
             meta: ItemMeta {
                 id: meta.id,
                 item_type: meta.item_type,
@@ -531,6 +586,7 @@ fn read_crl_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Option<
         not_after_unix: None,
         decrypt: DecryptStatus::NotEncrypted,
         has_own_pass: false,
+        paired_item_id: None,
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
@@ -558,6 +614,7 @@ fn read_template_item(
         not_after_unix: None,
         decrypt: DecryptStatus::NotEncrypted,
         has_own_pass: false,
+        paired_item_id: None,
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
@@ -582,6 +639,7 @@ fn read_public_key_item(
         not_after_unix: None,
         decrypt: DecryptStatus::NotEncrypted,
         has_own_pass: false,
+        paired_item_id: None,
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
@@ -616,19 +674,26 @@ fn read_private_key_row(
     Ok(Some((blob, has_own_pass)))
 }
 
-fn try_decrypt_key(blob: &[u8], password: Option<&str>) -> Result<(Option<String>, DecryptStatus), String> {
+fn try_decrypt_key(
+    blob: &[u8],
+    password: Option<&str>,
+) -> Result<(Option<String>, Option<Vec<u8>>, DecryptStatus), String> {
     match crypto::detect_format(blob) {
         None => {
             // Treat as plaintext PKCS#8 / SEC1 DER and pass through.
             let pem = pem_wrap("PRIVATE KEY", blob);
-            Ok((Some(pem), DecryptStatus::NotEncrypted))
+            Ok((Some(pem), Some(blob.to_vec()), DecryptStatus::NotEncrypted))
         }
         Some(_) => {
             let Some(pw) = password else {
                 return Err("missing password".into());
             };
             match crypto::decrypt_auto(blob, pw) {
-                Ok(plain) => Ok((Some(pem_wrap("PRIVATE KEY", &plain)), DecryptStatus::Ok)),
+                Ok(plain) => Ok((
+                    Some(pem_wrap("PRIVATE KEY", &plain)),
+                    Some(plain),
+                    DecryptStatus::Ok,
+                )),
                 Err(e) => Err(e.0),
             }
         }

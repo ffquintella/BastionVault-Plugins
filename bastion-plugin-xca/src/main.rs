@@ -44,6 +44,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod crypto;
+mod keymatch;
 mod proto;
 mod xca;
 
