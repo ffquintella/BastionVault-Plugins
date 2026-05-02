@@ -43,6 +43,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod chain;
 mod crypto;
 mod keymatch;
 mod proto;

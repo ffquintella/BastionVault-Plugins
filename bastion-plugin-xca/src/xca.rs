@@ -12,6 +12,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use x509_parser::prelude::*;
 
+use crate::chain;
 use crate::crypto;
 use crate::keymatch::{self, KeyFingerprint};
 
@@ -149,6 +150,30 @@ pub struct PreviewItem {
     /// the host's PKI engine can't accept via `config/ca`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_ca: bool,
+    /// For certs only (Phase v0.1.9): true when **at least one other
+    /// cert in this same import set was signed by this one**, OR
+    /// when this is a self-signed CA-flagged cert (a stand-alone
+    /// trust anchor still routes to the issuers tab). Drives the
+    /// emitter / leaf split in the GUI's Apply step. `is_ca` stays
+    /// around as a hint but should not be the routing decision —
+    /// some XCA files carry CA-flagged certs that never actually
+    /// signed anything in the file, and those belong on the
+    /// certificates tab.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signs_others: bool,
+    /// For certs only (Phase v0.1.9): when this cert's parent is
+    /// also in the import set, the parent's `items.id`. `None` for
+    /// self-signed roots and for leaves whose issuer is off-set.
+    /// Lets the GUI tag a cert's emitter as "owned" (parent we're
+    /// importing) vs "external".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_item_id: Option<i64>,
+    /// For certs only (Phase v0.1.9): the cert's Issuer DN as a
+    /// human-readable string. Always populated for certs (so the
+    /// GUI's Emitter column always has something to render), even
+    /// when the issuer isn't on this XCA file.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub signer_subject: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +260,11 @@ pub fn preview(
     // by equal fingerprint after the per-row pass.
     let mut cert_fingerprints: BTreeMap<i64, KeyFingerprint> = BTreeMap::new();
     let mut key_fingerprints: BTreeMap<i64, KeyFingerprint> = BTreeMap::new();
+    // Cert DERs stashed for the chain-detection post-pass (v0.1.9).
+    // The PreviewItem only carries PEM, so we'd otherwise have to
+    // decode it back to DER twice — once for the fingerprint, once
+    // for the chain. Keeping the bytes around is cheaper.
+    let mut cert_ders: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
     let mut summary = PreviewSummary {
         format_version: format_version.clone(),
         issuer_count: 0,
@@ -250,15 +280,16 @@ pub fn preview(
         match meta.item_type {
             ItemType::Cert => match read_cert_item(&conn, &meta) {
                 Ok(Some(item)) => {
-                    if item.is_ca {
-                        summary.issuer_count += 1;
-                    } else {
-                        summary.leaf_count += 1;
-                    }
                     if let Some(fp) = keymatch::fingerprint_cert(&item.der) {
                         cert_fingerprints.insert(meta.id, fp);
                     }
+                    cert_ders.insert(meta.id, item.der.clone());
                     items.push(item.into_preview(meta));
+                    // `summary.issuer_count` / `leaf_count` are
+                    // recomputed after the chain-detection pass so
+                    // the numbers reflect the routing the GUI will
+                    // actually use (signs_others), not the bare
+                    // BasicConstraints flag.
                 }
                 Ok(None) => skipped.push(format!("cert-row-missing:{}", meta.name)),
                 Err(e) => skipped.push(format!("cert-row-error:{}: {e}", meta.name)),
@@ -309,6 +340,9 @@ pub fn preview(
                                     has_own_pass,
                                     paired_item_id: None,
                                     is_ca: false,
+                                    signs_others: false,
+                                    signer_item_id: None,
+                                    signer_subject: String::new(),
                                     meta,
                                 });
                             }
@@ -326,6 +360,9 @@ pub fn preview(
                                     has_own_pass,
                                     paired_item_id: None,
                                     is_ca: false,
+                                    signs_others: false,
+                                    signer_item_id: None,
+                                    signer_subject: String::new(),
                                     meta,
                                 });
                             }
@@ -374,6 +411,41 @@ pub fn preview(
                 .and_then(|fp| fp_to_cert.get(fp).copied()),
             _ => None,
         };
+    }
+
+    // Chain-detection post-pass (v0.1.9). Walks the issuance graph
+    // across the imported cert set so each cert lands with a
+    // `signs_others` flag, an optional in-set parent id, and the
+    // human-readable Issuer DN. The GUI Apply step routes by
+    // `signs_others` instead of the bare `is_ca` flag, which fixes
+    // the case where an XCA file carries CA-flagged certs that
+    // never actually signed anything in the file.
+    let cert_pairs: Vec<(i64, &[u8])> = cert_ders
+        .iter()
+        .map(|(id, der)| (*id, der.as_slice()))
+        .collect();
+    let chain_info = chain::analyze(&cert_pairs);
+    for item in &mut items {
+        if matches!(item.meta.item_type, ItemType::Cert) {
+            if let Some(info) = chain_info.get(&item.meta.id) {
+                item.signs_others = info.signs_others;
+                item.signer_item_id = info.signer_item_id;
+                item.signer_subject = info.signer_subject.clone();
+            }
+        }
+    }
+    // Recompute issuer / leaf counts to match what the GUI will
+    // actually render. A cert is now an "issuer" iff it signed at
+    // least one other cert in the import set OR it's a self-signed
+    // CA (a stand-alone trust anchor).
+    for item in &items {
+        if matches!(item.meta.item_type, ItemType::Cert) {
+            if item.signs_others {
+                summary.issuer_count += 1;
+            } else {
+                summary.leaf_count += 1;
+            }
+        }
     }
 
     summary.skipped = skipped;
@@ -514,6 +586,13 @@ impl CertRow {
             has_own_pass: false,
             paired_item_id: None,
             is_ca: self.is_ca,
+            // Chain-driven fields are filled in by the post-pass in
+            // `preview()` once every cert has been parsed; default to
+            // false / empty here so the cert can still be emitted if
+            // the chain analysis somehow skips it.
+            signs_others: false,
+            signer_item_id: None,
+            signer_subject: String::new(),
             meta,
         }
     }
@@ -574,6 +653,9 @@ fn read_request_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Opt
             has_own_pass: false,
             paired_item_id: None,
             is_ca: false,
+            signs_others: false,
+            signer_item_id: None,
+            signer_subject: String::new(),
             meta: ItemMeta {
                 id: meta.id,
                 item_type: meta.item_type,
@@ -598,6 +680,9 @@ fn read_crl_item(conn: &Connection, meta: &ItemMeta) -> rusqlite::Result<Option<
         has_own_pass: false,
         paired_item_id: None,
         is_ca: false,
+        signs_others: false,
+        signer_item_id: None,
+        signer_subject: String::new(),
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
@@ -627,6 +712,9 @@ fn read_template_item(
         has_own_pass: false,
         paired_item_id: None,
         is_ca: false,
+        signs_others: false,
+        signer_item_id: None,
+        signer_subject: String::new(),
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,
@@ -653,6 +741,9 @@ fn read_public_key_item(
         has_own_pass: false,
         paired_item_id: None,
         is_ca: false,
+        signs_others: false,
+        signer_item_id: None,
+        signer_subject: String::new(),
         meta: ItemMeta {
             id: meta.id,
             item_type: meta.item_type,

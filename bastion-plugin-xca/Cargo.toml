@@ -1,6 +1,6 @@
 [package]
 name = "bastion-plugin-xca"
-version = "0.1.8"
+version = "0.1.9"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -42,3 +42,9 @@ hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "test-util"] }
+# Used by the chain-detection unit tests to mint deterministic
+# self-signed + signed-by certs without committing fixtures. The
+# `x509-parser` feature is what unlocks `Issuer::from_ca_cert_pem`,
+# which is the most ergonomic way to reconstruct a signing handle
+# from a self-signed cert in test setup.
+rcgen = { version = "0.14", features = ["x509-parser"] }
