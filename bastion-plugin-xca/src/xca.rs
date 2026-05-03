@@ -148,7 +148,14 @@ pub struct PreviewItem {
     /// `cA=true` or XCA's `certs.ca` flag). Lets the GUI route CA
     /// certs to the issuer-import path and skip leaf certs (which
     /// the host's PKI engine can't accept via `config/ca`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ///
+    /// v0.1.10: always serialised (no `skip_serializing_if`). The
+    /// previous "skip when false" behaviour collided with the GUI's
+    /// fallback heuristic for older plugins — `is_ca: undefined`
+    /// was treated as "could be a CA", so leaf certs landed at
+    /// `pki/config/ca` and bounced. A definitive false-on-the-wire
+    /// fixes the routing.
+    #[serde(default)]
     pub is_ca: bool,
     /// For certs only (Phase v0.1.9): true when **at least one other
     /// cert in this same import set was signed by this one**, OR
@@ -158,8 +165,8 @@ pub struct PreviewItem {
     /// around as a hint but should not be the routing decision —
     /// some XCA files carry CA-flagged certs that never actually
     /// signed anything in the file, and those belong on the
-    /// certificates tab.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// certificates tab. Always serialised (see `is_ca` note).
+    #[serde(default)]
     pub signs_others: bool,
     /// For certs only (Phase v0.1.9): when this cert's parent is
     /// also in the import set, the parent's `items.id`. `None` for
