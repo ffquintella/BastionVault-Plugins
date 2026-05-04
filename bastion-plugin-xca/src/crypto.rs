@@ -17,7 +17,7 @@
 //! Format detection sniffs the magic prefix.
 
 use aes::Aes256;
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 use hmac::Hmac;
 use md5::{Digest as Md5Digest, Md5};
 use pbkdf2::pbkdf2;
@@ -185,7 +185,7 @@ fn evp_bytes_to_key_md5(password: &[u8], salt: &[u8]) -> ([u8; 32], [u8; 16]) {
 fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
     let mut buf = ciphertext.to_vec();
     let plain = Aes256CbcDec::new(key.into(), iv.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .decrypt_padded::<Pkcs7>(&mut buf)
         .map_err(|_| ())?;
     Ok(plain.to_vec())
 }

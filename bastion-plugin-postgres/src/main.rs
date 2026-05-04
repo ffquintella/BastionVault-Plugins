@@ -32,7 +32,7 @@
 use std::io;
 
 use base64::Engine as _;
-use rand::RngCore;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -263,7 +263,7 @@ where
 
 fn generate_role_name(prefix: &str) -> String {
     let mut bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     let mut s = String::with_capacity(prefix.len() + 16);
     s.push_str(prefix);
     for b in bytes {
@@ -276,7 +276,7 @@ fn generate_role_name(prefix: &str) -> String {
 
 fn generate_password() -> String {
     let mut bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

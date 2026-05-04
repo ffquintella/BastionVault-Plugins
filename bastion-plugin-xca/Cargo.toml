@@ -20,23 +20,23 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-
 # a system libsqlite3 — same trade-off the host's hiqlite backend
 # already makes for the embedded Raft store. Keeps the plugin binary
 # self-contained at the cost of ~2 MiB.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 # AES-256-CBC drives both XCA encryption envelopes (EVP_BytesToKey
 # pre-2.0 and PBKDF2 post-2.4). `cbc` exposes the block-mode wrapper.
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
 # MD5 + 1-iteration EVP_BytesToKey for the legacy XCA envelope.
-md-5 = "0.10"
+md-5 = "0.11"
 # PBKDF2-HMAC-SHA512 for the modern XCA envelope. SHA-256 is also used
 # inside XCA for its database-password integrity hash.
-pbkdf2 = "0.12"
-hmac = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
+pbkdf2 = "0.13"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
 # Cert / CSR / CRL parsing — extracts subject, serial, validity for
 # the `preview` summary. `x509-parser` is the lighter ecosystem;
 # we only read fields, never construct.
-x509-parser = "0.16"
+x509-parser = "0.18"
 # Hex for cert serial display.
 hex = "0.4"
 
