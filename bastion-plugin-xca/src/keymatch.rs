@@ -39,25 +39,50 @@ pub fn fingerprint_cert(cert_der: &[u8]) -> Option<KeyFingerprint> {
     Some(sha256(spki.subject_public_key.data.as_ref()))
 }
 
-/// Fingerprint a decrypted PKCS#8 `PrivateKeyInfo`. Returns `None`
-/// for algorithms whose private-key form doesn't include the public
+/// Fingerprint a decrypted private key. Accepts PKCS#8
+/// `PrivateKeyInfo` (XCA ≥ 2.0) and bare PKCS#1 `RSAPrivateKey`
+/// / SEC1 `ECPrivateKey` DER (XCA pre-2.0). Returns `None` for
+/// algorithms whose private-key form doesn't include the public
 /// half — caller should treat those as un-pairable.
-pub fn fingerprint_private_key(pkcs8_der: &[u8]) -> Option<KeyFingerprint> {
-    let pk = parse_pkcs8(pkcs8_der)?;
-    if pk.alg_oid == OID_RSA_ENCRYPTION {
-        let pubkey = rsa_public_from_private(pk.private_key)?;
-        Some(sha256(&pubkey))
-    } else if pk.alg_oid == OID_EC_PUBLIC_KEY {
-        let bits = ec_public_from_private(pk.private_key)?;
-        Some(sha256(&bits))
-    } else if pk.alg_oid == OID_ED25519 || pk.alg_oid == OID_ED448 {
-        // The optional [1] IMPLICIT publicKey BIT STRING is the only
-        // path to a fingerprint here without doing curve math.
-        let bits = pk.public_key?;
-        Some(sha256(bits))
-    } else {
-        None
+///
+/// Without this fallback, XCA databases that mix old + new schema
+/// versions silently lose cert↔key correlation: the cert
+/// fingerprints (via `SubjectPublicKeyInfo`) but the key doesn't
+/// (because it isn't PKCS#8), so `paired_item_id` stays `None` and
+/// the GUI Apply path can't find the key, skipping the issuer
+/// without an error.
+pub fn fingerprint_private_key(der: &[u8]) -> Option<KeyFingerprint> {
+    if let Some(pk) = parse_pkcs8(der) {
+        if pk.alg_oid == OID_RSA_ENCRYPTION {
+            let pubkey = rsa_public_from_private(pk.private_key)?;
+            return Some(sha256(&pubkey));
+        } else if pk.alg_oid == OID_EC_PUBLIC_KEY {
+            let bits = ec_public_from_private(pk.private_key)?;
+            return Some(sha256(&bits));
+        } else if pk.alg_oid == OID_ED25519 || pk.alg_oid == OID_ED448 {
+            // The optional [1] IMPLICIT publicKey BIT STRING is the
+            // only path to a fingerprint here without doing curve math.
+            let bits = pk.public_key?;
+            return Some(sha256(bits));
+        }
+        return None;
     }
+    // PKCS#1 RSAPrivateKey fallback. XCA pre-2.0 stored RSA keys as
+    // bare `i2d_RSAPrivateKey` DER (no PrivateKeyInfo wrapper), and
+    // `try_decrypt_key` passes those through unchanged. Detect the
+    // shape by trying `rsa_public_from_private` directly: it expects
+    // `SEQUENCE { version INTEGER, n INTEGER, e INTEGER, ... }`,
+    // which fails cleanly on a PKCS#8 blob (whose third element is a
+    // SEQUENCE, not an INTEGER) so there's no risk of a false hit.
+    if let Some(pubkey) = rsa_public_from_private(der) {
+        return Some(sha256(&pubkey));
+    }
+    // SEC1 `ECPrivateKey` bare DER fallback. Same shape signal:
+    // `SEQUENCE { version INTEGER, privateKey OCTET STRING, ... }`.
+    if let Some(bits) = ec_public_from_private(der) {
+        return Some(sha256(&bits));
+    }
+    None
 }
 
 fn sha256(bytes: &[u8]) -> KeyFingerprint {
