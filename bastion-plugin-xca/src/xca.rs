@@ -800,11 +800,43 @@ fn try_decrypt_key(
                 return Err("missing password".into());
             };
             match crypto::decrypt_auto(blob, pw) {
-                Ok(plain) => Ok((
-                    Some(pem_wrap("PRIVATE KEY", &plain)),
-                    Some(plain),
-                    DecryptStatus::Ok,
-                )),
+                Ok(plain) => {
+                    // Sanity-check: AES-CBC + PKCS#7 padding has a
+                    // non-trivial chance (~1/256 to 1/65536 depending
+                    // on byte distribution) of producing valid-padding
+                    // garbage when the key is wrong. Without a content
+                    // check, a wrong-password decrypt of a key
+                    // encrypted with the per-key `ownPass` (XCA's
+                    // mechanism for keys encrypted separately from
+                    // the database master password) silently surfaces
+                    // as "ok" and the host gets random bytes.
+                    //
+                    // Every supported private-key shape — PKCS#8
+                    // PrivateKeyInfo, PKCS#1 RSAPrivateKey, SEC1
+                    // ECPrivateKey, raw Ed25519 OneAsymmetricKey —
+                    // starts with a DER SEQUENCE (`0x30`). A first
+                    // byte that isn't `0x30` is a near-certain sign
+                    // the password was wrong; the operator needs to
+                    // supply the per-key password via
+                    // `per_key_passwords`.
+                    if plain.first() != Some(&0x30) {
+                        // Operator-facing message — keep it plain.
+                        // Technical detail (first byte / DER shape) goes in
+                        // the host's diagnostic log when the GUI re-shows
+                        // the failure.
+                        return Err(
+                            "password does not match — this key is encrypted \
+                             with a different password than the database master. \
+                             Supply the per-key password and retry."
+                                .into(),
+                        );
+                    }
+                    Ok((
+                        Some(pem_wrap("PRIVATE KEY", &plain)),
+                        Some(plain),
+                        DecryptStatus::Ok,
+                    ))
+                }
                 Err(e) => Err(e.0),
             }
         }

@@ -83,7 +83,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bastion-plugin-postgres"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "base64",
  "rand",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "bastion-plugin-totp"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "bastion-plugin-sdk",
  "hmac",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "bastion-plugin-xca"
-version = "0.1.13"
+version = "0.1.16"
 dependencies = [
  "aes",
  "base64",
