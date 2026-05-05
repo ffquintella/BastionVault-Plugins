@@ -3,7 +3,7 @@
 # Plugins page in the GUI.
 
 name        = "totp"
-version     = "0.1.14"
+version     = "0.1.15"
 plugin_type = "secret"
 runtime     = "wasm"
 abi_version = "1.0"
