@@ -1,5 +1,5 @@
 name        = "xca-import"
-version     = "0.1.17"
+version     = "0.1.18"
 plugin_type = "tool"
 runtime     = "process"
 abi_version = "1.0"
