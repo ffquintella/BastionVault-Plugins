@@ -10,17 +10,22 @@ use std::collections::BTreeMap;
 pub const EMPTY_SENTINELS: &[&str] = &["", "n/a", "na", "null", "none", "-"];
 
 /// PMP `OS Type` row classification. Drives whether the row becomes
-/// a Resource entry or a KV blob.
+/// a Resource entry or a KV blob. The general rule: only rows that
+/// describe a *connectable device* (server, database, firewall,
+/// switch, network device, website, application) become BV
+/// Resources. Everything else — keys, licences, application
+/// passwords, incident attachments, unrecognised PMP custom types
+/// — routes to KV. The Resources inventory is for things you can
+/// open a session against; passive credentials live in KV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     /// Maps to a Resource (the `bv_type` is the BV resource type id).
     Resource,
     /// Maps to a KV blob under `secret/pmp-import/<batch>/<kind>/...`.
     /// `kind` is the trailing path segment (`generic-keys`,
-    /// `application-passwords`, `license-store`).
+    /// `application-passwords`, `license-store`, `incident-files`,
+    /// `other`).
     Kv,
-    /// We didn't recognise the value; the wizard will prompt.
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,9 +50,6 @@ impl TypeMapping {
     }
     fn kv(kind: &str) -> Self {
         Self { kind: RowKind::Kv, target: kind.into(), defaults: BTreeMap::new() }
-    }
-    fn unknown() -> Self {
-        Self { kind: RowKind::Unknown, target: String::new(), defaults: BTreeMap::new() }
     }
 }
 
@@ -76,7 +78,15 @@ pub fn map_os_type(raw: &str) -> TypeMapping {
         "generic keys" => TypeMapping::kv("generic-keys"),
         "application passwords" => TypeMapping::kv("application-passwords"),
         "license store" => TypeMapping::kv("license-store"),
-        _ => TypeMapping::unknown(),
+        "arquivos de incidentes" | "incident files" => TypeMapping::kv("incident-files"),
+        "resource type" => TypeMapping::kv("other"),
+        // Anything we don't recognise is a passive credential, not
+        // a connectable device — route it to KV under `other` so
+        // the inventory stays clean. Operators who want a custom
+        // resource type for these still get it: they register the
+        // type via Settings → Resource Types and then re-import
+        // with `type_overrides` pointing at the new id.
+        _ => TypeMapping::kv("other"),
     }
 }
 
@@ -84,15 +94,23 @@ pub fn map_os_type(raw: &str) -> TypeMapping {
 /// resource type id (`"firewall"`, `"network_device"`, …); they win
 /// over the fixed table but we keep the `defaults` from the table so
 /// `vendor=cisco` still pre-fills when an operator overrides
-/// `Cisco IOS` from `switch` to `firewall`.
+/// `Cisco IOS` from `switch` to `firewall`. An override of the form
+/// `"kv:<kind>"` re-routes the row to KV under that kind (lets the
+/// operator force a row that defaulted to a Resource into KV).
 pub fn map_with_override(
     raw: &str,
     overrides: &BTreeMap<String, String>,
 ) -> TypeMapping {
     let mut m = map_os_type(raw);
     if let Some(v) = overrides.get(raw.trim()) {
-        m.kind = RowKind::Resource;
-        m.target = v.clone();
+        if let Some(kind) = v.strip_prefix("kv:") {
+            m.kind = RowKind::Kv;
+            m.target = kind.to_string();
+            m.defaults.clear();
+        } else {
+            m.kind = RowKind::Resource;
+            m.target = v.clone();
+        }
     }
     m
 }
@@ -179,7 +197,13 @@ mod tests {
 
         assert_eq!(map_os_type("Web Site Accounts").target, "website");
 
-        assert_eq!(map_os_type("Arquivos de Incidentes").kind, RowKind::Unknown);
+        // Non-connectable PMP types route to KV, not to Resources.
+        assert_eq!(map_os_type("Arquivos de Incidentes").kind, RowKind::Kv);
+        assert_eq!(map_os_type("Arquivos de Incidentes").target, "incident-files");
+        assert_eq!(map_os_type("Resource Type").kind, RowKind::Kv);
+        assert_eq!(map_os_type("Resource Type").target, "other");
+        assert_eq!(map_os_type("Some Custom PMP Type").kind, RowKind::Kv);
+        assert_eq!(map_os_type("Some Custom PMP Type").target, "other");
     }
 
     #[test]

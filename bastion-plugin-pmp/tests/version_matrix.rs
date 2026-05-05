@@ -184,17 +184,55 @@ fn rejects_when_required_column_is_absent() {
 }
 
 #[test]
-fn unknown_pmp_os_type_falls_back_to_a_slugged_custom_type() {
+fn non_connectable_pmp_types_route_to_kv_not_resources() {
+    // PMP rows that don't describe a connectable device — incident
+    // attachments, generic "Resource Type" rows, unrecognised
+    // custom PMP types — must NOT create empty BV resources. They
+    // belong in KV under either a friendly kind (`incident-files`)
+    // or the catch-all `other`.
     let sheet = build_synthetic_sheet(
         "ExportPasswordView",
+        &["Resource Name", "User Account", "Password", "OS Type"],
         &[
-            "Resource Name", "User Account", "Password", "OS Type",
+            vec!["incident-2024-q3", "admin", "pw1", "Arquivos de Incidentes"],
+            vec!["legacy-asset", "admin", "pw2", "Resource Type"],
+            vec!["unknown-thing", "admin", "pw3", "Some Custom PMP Type"],
         ],
-        &[vec!["mystery-box", "admin", "pw", "Arquivos de Incidentes"]],
     );
     let plan = plan::build(&sheet, &opts());
+    assert_eq!(plan.summary.resource_count, 0, "non-connectable rows should NOT create resources");
+    assert_eq!(plan.summary.kv_blob_count, 3);
+    assert_eq!(plan.summary.kv_distribution.get("incident-files"), Some(&1));
+    assert_eq!(plan.summary.kv_distribution.get("other"), Some(&2));
+}
+
+#[test]
+fn type_overrides_can_force_kv_or_resource() {
+    let sheet = build_synthetic_sheet(
+        "ExportPasswordView",
+        &["Resource Name", "User Account", "Password", "OS Type"],
+        &[
+            vec!["weird-thing", "admin", "pw", "Some Custom PMP Type"],
+            vec!["srv01", "root", "pw", "Linux"],
+        ],
+    );
+    // Override "Some Custom PMP Type" → register it as a server,
+    // and force the Linux row into KV instead. Both directions
+    // should work.
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert("Some Custom PMP Type".into(), "server".into());
+    overrides.insert("Linux".into(), "kv:other".into());
+    let opts = plan::PlanOptions {
+        batch_id: Some("override-test".into()),
+        type_overrides: overrides,
+        ..Default::default()
+    };
+    let plan = plan::build(&sheet, &opts);
     assert_eq!(plan.summary.resource_count, 1);
-    assert_eq!(plan.resources[0].bv_type, "arquivos-de-incidentes");
+    assert_eq!(plan.resources[0].name, "weird-thing");
+    assert_eq!(plan.resources[0].bv_type, "server");
+    assert_eq!(plan.summary.kv_blob_count, 1);
+    assert_eq!(plan.kv_blobs[0].kind, "other");
 }
 
 #[test]

@@ -219,7 +219,7 @@ pub fn build(sheet: &ParsedSheet, opts: &PlanOptions) -> ImportPlan {
                 }
                 kv_blobs.push(KvBlobPlan { kind: mapping_.target.clone(), path, data });
             }
-            RowKind::Resource | RowKind::Unknown => {
+            RowKind::Resource => {
                 if mapping::is_empty(&user_raw) {
                     skipped.push(SkipEntry {
                         row: row.row_number,
@@ -234,16 +234,7 @@ pub fn build(sheet: &ParsedSheet, opts: &PlanOptions) -> ImportPlan {
                     });
                     continue;
                 }
-                let bv_type = if matches!(mapping_.kind, RowKind::Unknown) {
-                    // Unknown PMP type — synthesise a slug from the
-                    // raw value. The wizard picks this up via
-                    // `summary.unknown_pmp_types` and offers to
-                    // register a custom type.
-                    mapping::sanitise_name(os_type_raw.trim())
-                        .to_ascii_lowercase()
-                } else {
-                    mapping_.target.clone()
-                };
+                let bv_type = mapping_.target.clone();
                 let res_name = mapping::sanitise_name(&resource_name_raw);
                 let entry = resources.entry(res_name.clone()).or_insert_with(|| {
                     order.push(res_name.clone());

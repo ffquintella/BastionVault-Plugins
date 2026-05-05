@@ -1,5 +1,5 @@
 name        = "pmp-import"
-version     = "0.1.0"
+version     = "0.1.1"
 plugin_type = "tool"
 runtime     = "process"
 abi_version = "1.0"
