@@ -4,6 +4,7 @@ members = [
     "bastion-plugin-totp",
     "bastion-plugin-postgres",
     "bastion-plugin-xca",
+    "bastion-plugin-pmp",
 ]
 
 [workspace.package]

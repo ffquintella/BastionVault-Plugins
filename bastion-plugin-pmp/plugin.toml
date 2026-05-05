@@ -1,0 +1,21 @@
+name        = "pmp-import"
+version     = "0.1.0"
+plugin_type = "tool"
+runtime     = "process"
+abi_version = "1.0"
+
+# Filled in by `bv-plugin-pack` at pack time.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "ManageEngine Password Manager Pro (PMP) `ExportPasswordView` importer. Reads `.xls` and `.xlsx` exports, splits the overloaded `OS Type` column into BV `type` + `os_type`, collapses multi-account rows into one resource with N secrets, routes the non-resource-shaped row types (Generic Keys / Application Passwords / License Store) into the KV engine, and derives an asset group per PMP `Department`. Returns a structured plan the GUI walks via existing Resource / KV / Asset Group routes."
+
+[capabilities]
+# The plugin reads files supplied by the operator (the `.xls`/`.xlsx`
+# path or inline base64) and does not need storage, audit, crypto,
+# or network capabilities — the host's GUI applies the returned
+# plan via the regular Resource / KV / Asset Group route surface,
+# where existing policy + audit enforcement runs.
+log_emit   = true
+audit_emit = false
+allowed_hosts = []
