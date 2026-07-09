@@ -149,6 +149,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bastion-plugin-webhook-notify"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bastion-plugin-sdk",
+ "serde",
+ "serde_json",
+ "serial_test",
+]
+
+[[package]]
 name = "bastion-plugin-xca"
 version = "0.1.21"
 dependencies = [

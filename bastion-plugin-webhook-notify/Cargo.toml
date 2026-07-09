@@ -1,0 +1,28 @@
+[package]
+name = "bastion-plugin-webhook-notify"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reference BastionVault app-module plugin: posts mount activity to an admin-granted webhook (Extensibility v2)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The `app` feature brings the `AppHost` / `AppModule` / `app_module!`
+# authoring surface for `bvx.*`.
+bastion-plugin-sdk = { path = "../../crates/bastion-plugin-sdk", features = ["app"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+bastion-plugin-sdk = { path = "../../crates/bastion-plugin-sdk", features = ["app", "host_test"] }
+serial_test = "3"
+
+[features]
+# Passthrough so `cargo test --features host_test` exercises the
+# host-stub-backed handler tests in src/lib.rs.
+host_test = ["bastion-plugin-sdk/host_test"]

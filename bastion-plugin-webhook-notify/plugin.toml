@@ -1,0 +1,44 @@
+# BastionVault app-module plugin manifest (Extensibility v2).
+#
+# Operators upload this alongside the .wasm binary + the app-module
+# asset via the Plugins page. The app module runs in the Tauri backend
+# sandbox; its network access is double-gated — this manifest *requests*
+# the host below, and an admin must additionally authorize it in the
+# Plugins → Network access panel before `bvx.net_http` works.
+
+name        = "webhook-notify"
+version     = "0.1.0"
+plugin_type = "app"
+runtime     = "wasm"
+# App-module capabilities require the v2 ABI minor.
+abi_version = "1.1"
+
+# Filled in by the host / pack tool on registration.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "Posts mount activity to an admin-granted webhook. Reference for the Extensibility v2 app-module surface (dynamic menus + vault-API + network)."
+
+[capabilities]
+log_emit = true
+
+# Extensibility v2 app-module capabilities. `dynamic_menus` lights up
+# bvx.menu_*, `api_paths` scopes bvx.api_request to this plugin's own
+# mount, and `net` *requests* outbound access to the host below (the
+# admin grant is the second key).
+[capabilities.app]
+dynamic_menus = true
+api_paths     = ["{mount}/"]
+
+[capabilities.app.net]
+hosts      = ["hooks.example.com"]
+https_only = true
+
+# The app-module WASM asset. sha256/size are stamped by `bv-plugin-pack`
+# over the compiled artifact; the host serves it content-addressed and
+# the Tauri runtime fetches + instantiates it.
+[[client_assets]]
+name = "webhook_notify_app.wasm"
+kind = "app-module"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size = 0
