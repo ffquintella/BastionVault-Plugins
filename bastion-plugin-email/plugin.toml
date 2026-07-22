@@ -15,10 +15,13 @@ description = "Email notification channel — delivers BastionVault notification
 # not need vault storage — all state is the operator's config.
 log_emit   = true
 audit_emit = true
-# Process runtime: real OS network for SMTP / Graph. Declarative-only in
-# v1 (the host does not enforce egress at the OS level — wrap under
-# systemd / k8s / Docker for hard filtering).
-allowed_hosts = ["*"]
+# Process runtime: real OS network for SMTP / Graph. Left empty because
+# the target host is operator-configured (`smtp_host` / Graph endpoint),
+# so no static allowlist can be correct — and the host refuses a bare
+# `*` at registration. The field is declarative-only in v1 anyway (the
+# host does not enforce egress at the OS level); operators who need hard
+# egress filtering wrap BastionVault under systemd / k8s / Docker.
+allowed_hosts = []
 
 # Provides one delivery channel: "email".
 [[capabilities.notification_channels]]

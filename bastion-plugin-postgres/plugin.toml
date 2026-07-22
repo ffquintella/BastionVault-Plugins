@@ -16,10 +16,13 @@ description = "Postgres dynamic-credential plugin. Issues short-lived role-bound
 # the host's lease manager via the response payload.
 log_emit   = true
 audit_emit = true
-# Declarative-only in v1: the host doesn't enforce egress at the OS
-# level (see features/plugin-system.md → Phase 2). Operators who need
-# hard egress filtering wrap BastionVault under systemd / k8s / Docker.
-allowed_hosts = ["*"]
+# Left empty because the database host is operator-configured (the
+# connection string), so no static allowlist can be correct — and the
+# host refuses a bare `*` at registration. Declarative-only in v1: the
+# host doesn't enforce egress at the OS level (see
+# features/plugin-system.md → Phase 2). Operators who need hard egress
+# filtering wrap BastionVault under systemd / k8s / Docker.
+allowed_hosts = []
 
 # Operators set the connection string + role policy via the Configure
 # modal. Connection string is treated as a secret so it doesn't echo
