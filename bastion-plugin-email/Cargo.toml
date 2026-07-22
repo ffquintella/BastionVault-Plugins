@@ -1,0 +1,30 @@
+[package]
+name = "bastion-plugin-email"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Email notification channel plugin for BastionVault. Delivers notifications over generic SMTP or Office 365 (OAuth2 / Microsoft Graph). Process runtime."
+
+[[bin]]
+name = "bastion-plugin-email"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+# SMTP delivery. rustls (not openssl) to match the host crypto policy.
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1",
+    "tokio1-rustls-tls",
+    "smtp-transport",
+    "builder",
+] }
+# Office 365 OAuth2 token + Microsoft Graph sendMail. rustls-tls only.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }

@@ -1,0 +1,132 @@
+name        = "email"
+version     = "0.1.0"
+plugin_type = "notification-channel"
+runtime     = "process"
+# Notification capabilities require the v2 ABI minor 2.
+abi_version = "1.2"
+
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "Email notification channel — delivers BastionVault notifications over a generic SMTP server or Office 365 (OAuth2 / Microsoft Graph sendMail)."
+
+[capabilities]
+# Logs delivery failures and emits an audit event per send batch. It does
+# not need vault storage — all state is the operator's config.
+log_emit   = true
+audit_emit = true
+# Process runtime: real OS network for SMTP / Graph. Declarative-only in
+# v1 (the host does not enforce egress at the OS level — wrap under
+# systemd / k8s / Docker for hard filtering).
+allowed_hosts = ["*"]
+
+# Provides one delivery channel: "email".
+[[capabilities.notification_channels]]
+id          = "email"
+name        = "Email"
+kind        = "email"
+description = "Delivers notifications by email via SMTP or Office 365."
+
+# ── Operator config (set in the GUI Configure modal) ──────────────────
+
+[[config_schema]]
+name        = "mode"
+label       = "Mode"
+description = "Delivery mode. 'smtp' uses a generic SMTP server; 'office365' uses OAuth2 client-credentials + Microsoft Graph sendMail."
+kind        = "select"
+required    = true
+default     = "smtp"
+options     = ["smtp", "office365"]
+
+# ── Generic SMTP ──────────────────────────────────────────────────────
+
+[[config_schema]]
+name        = "smtp_host"
+label       = "SMTP host"
+description = "SMTP server hostname (e.g. smtp.example.com, or smtp.office365.com for O365 SMTP AUTH)."
+kind        = "string"
+required    = false
+
+[[config_schema]]
+name        = "smtp_port"
+label       = "SMTP port"
+description = "SMTP port. 587 for STARTTLS, 465 for implicit TLS, 25 for none."
+kind        = "int"
+required    = false
+default     = "587"
+
+[[config_schema]]
+name        = "smtp_tls"
+label       = "SMTP TLS"
+description = "Transport security: 'starttls' (587), 'tls' (implicit, 465), or 'none' (unencrypted — testing only)."
+kind        = "select"
+required    = false
+default     = "starttls"
+options     = ["starttls", "tls", "none"]
+
+[[config_schema]]
+name        = "smtp_username"
+label       = "SMTP username"
+description = "SMTP AUTH username. Leave blank for an unauthenticated relay."
+kind        = "string"
+required    = false
+
+[[config_schema]]
+name        = "smtp_password"
+label       = "SMTP password"
+description = "SMTP AUTH password. Stored as a secret (barrier-encrypted, never echoed back)."
+kind        = "secret"
+required    = false
+
+[[config_schema]]
+name        = "from_address"
+label       = "From address"
+description = "Envelope + header From address for outgoing mail (SMTP mode)."
+kind        = "string"
+required    = false
+
+[[config_schema]]
+name        = "from_name"
+label       = "From name"
+description = "Optional display name for the From header."
+kind        = "string"
+required    = false
+
+# ── Office 365 (OAuth2 / Graph) ───────────────────────────────────────
+
+[[config_schema]]
+name        = "o365_tenant_id"
+label       = "O365 tenant ID"
+description = "Azure AD / Entra tenant ID (GUID) for the Office 365 mode."
+kind        = "string"
+required    = false
+
+[[config_schema]]
+name        = "o365_client_id"
+label       = "O365 client ID"
+description = "App registration (client) ID with Mail.Send application permission."
+kind        = "string"
+required    = false
+
+[[config_schema]]
+name        = "o365_client_secret"
+label       = "O365 client secret"
+description = "App registration client secret. Stored as a secret (barrier-encrypted, never echoed back)."
+kind        = "secret"
+required    = false
+
+[[config_schema]]
+name        = "o365_sender"
+label       = "O365 sender address"
+description = "The mailbox the message is sent as (POST /users/{sender}/sendMail). Must be a real mailbox the app is permitted to send from."
+kind        = "string"
+required    = false
+
+# ── Common ────────────────────────────────────────────────────────────
+
+[[config_schema]]
+name        = "subject_prefix"
+label       = "Subject prefix"
+description = "Optional prefix prepended to every email subject (e.g. '[BastionVault] ')."
+kind        = "string"
+required    = false
