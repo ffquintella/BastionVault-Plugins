@@ -1,5 +1,5 @@
 name        = "email"
-version     = "0.1.0"
+version     = "0.1.1"
 plugin_type = "notification-channel"
 runtime     = "process"
 # Notification capabilities require the v2 ABI minor 2.
@@ -31,6 +31,12 @@ kind        = "email"
 description = "Delivers notifications by email via SMTP or Office 365."
 
 # ── Operator config (set in the GUI Configure modal) ──────────────────
+#
+# The two modes need disjoint field sets, so the mode-specific fields
+# carry `required_if` instead of a flat `required`: the host refuses to
+# save an SMTP config with no From address (or an O365 config with no
+# app registration) rather than letting the operator discover it as a
+# failed delivery.
 
 [[config_schema]]
 name        = "mode"
@@ -49,6 +55,7 @@ label       = "SMTP host"
 description = "SMTP server hostname (e.g. smtp.example.com, or smtp.office365.com for O365 SMTP AUTH)."
 kind        = "string"
 required    = false
+required_if = { field = "mode", equals = ["smtp"] }
 
 [[config_schema]]
 name        = "smtp_port"
@@ -84,9 +91,10 @@ required    = false
 [[config_schema]]
 name        = "from_address"
 label       = "From address"
-description = "Envelope + header From address for outgoing mail (SMTP mode)."
+description = "Envelope + header From address for outgoing mail (SMTP mode). Usually the same as the SMTP username."
 kind        = "string"
 required    = false
+required_if = { field = "mode", equals = ["smtp"] }
 
 [[config_schema]]
 name        = "from_name"
@@ -103,6 +111,7 @@ label       = "O365 tenant ID"
 description = "Azure AD / Entra tenant ID (GUID) for the Office 365 mode."
 kind        = "string"
 required    = false
+required_if = { field = "mode", equals = ["office365"] }
 
 [[config_schema]]
 name        = "o365_client_id"
@@ -110,6 +119,7 @@ label       = "O365 client ID"
 description = "App registration (client) ID with Mail.Send application permission."
 kind        = "string"
 required    = false
+required_if = { field = "mode", equals = ["office365"] }
 
 [[config_schema]]
 name        = "o365_client_secret"
@@ -117,6 +127,7 @@ label       = "O365 client secret"
 description = "App registration client secret. Stored as a secret (barrier-encrypted, never echoed back)."
 kind        = "secret"
 required    = false
+required_if = { field = "mode", equals = ["office365"] }
 
 [[config_schema]]
 name        = "o365_sender"
@@ -124,6 +135,7 @@ label       = "O365 sender address"
 description = "The mailbox the message is sent as (POST /users/{sender}/sendMail). Must be a real mailbox the app is permitted to send from."
 kind        = "string"
 required    = false
+required_if = { field = "mode", equals = ["office365"] }
 
 # ── Common ────────────────────────────────────────────────────────────
 

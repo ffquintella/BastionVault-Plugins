@@ -28,15 +28,25 @@ Set via the Plugins → Configure modal (or `PUT /v1/sys/plugins/email/config`).
 - `subject_prefix` — optional prefix for every subject.
 
 **SMTP mode**
-- `smtp_host`, `smtp_port` (587 STARTTLS / 465 TLS / 25 none)
+- `smtp_host` (**required in this mode**), `smtp_port` (587 STARTTLS /
+  465 TLS / 25 none)
 - `smtp_tls` — `starttls` | `tls` | `none`
 - `smtp_username`, `smtp_password` (**secret**)
-- `from_address`, `from_name`
+- `from_address` (**required in this mode** — usually the same as
+  `smtp_username`), `from_name`
 
 **Office 365 mode**
 - `o365_tenant_id`, `o365_client_id`, `o365_client_secret` (**secret**)
-- `o365_sender` — the mailbox to send as (the app registration must hold
-  the `Mail.Send` **application** permission, admin-consented)
+  — all **required in this mode**
+- `o365_sender` (**required in this mode**) — the mailbox to send as
+  (the app registration must hold the `Mail.Send` **application**
+  permission, admin-consented)
+
+The per-mode fields are marked with `required_if = { field = "mode",
+equals = […] }` in `plugin.toml`, so the host rejects an incomplete
+config when it is saved rather than at delivery time. Switching `mode`
+in the Configure modal re-marks which fields are mandatory; values for
+the other mode stay stored and are simply not required.
 
 Passwords/secrets use the `secret` config kind: barrier-encrypted at rest
 and never echoed back on config read.
