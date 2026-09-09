@@ -1,6 +1,6 @@
 [package]
 name = "bastion-plugin-xca"
-version = "0.1.21"
+version = "0.1.22"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -21,10 +21,14 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-
 # already makes for the embedded Raft store. Keeps the plugin binary
 # self-contained at the cost of ~2 MiB.
 rusqlite = { version = "0.39", features = ["bundled"] }
-# AES-256-CBC drives both XCA encryption envelopes (EVP_BytesToKey
-# pre-2.0 and PBKDF2 post-2.4). `cbc` exposes the block-mode wrapper.
+# AES-256-CBC drives the PKCS#8 PBES2 envelope XCA >= 2.5 writes and
+# the OpenSSL `Salted__` form. `cbc` exposes the block-mode wrapper.
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
+# 3DES-EDE3-CBC is the cipher XCA <= 2.4 used for its own private-key
+# envelope, and long-lived .xdb files are still full of those rows.
+# Read-only compatibility: the plugin never encrypts with it.
+des = "0.9"
 # MD5 + 1-iteration EVP_BytesToKey for the legacy XCA envelope.
 md-5 = "0.11"
 # PBKDF2-HMAC-SHA512 for the modern XCA envelope. SHA-256 is also used

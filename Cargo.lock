@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "bastion-plugin-sdk"
-version = "0.1.0"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -179,11 +179,12 @@ dependencies = [
 
 [[package]]
 name = "bastion-plugin-xca"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "aes",
  "base64",
  "cbc",
+ "des",
  "hex",
  "hmac",
  "md-5",
@@ -416,6 +417,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "des"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "916a94e407b54f9034d71dd748234cd1e516ced6284009906ae246f177eafe5a"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]

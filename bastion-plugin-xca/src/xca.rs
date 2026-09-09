@@ -135,7 +135,9 @@ pub struct PreviewItem {
     /// Decryption result for private keys; always `NotEncrypted` for
     /// other item types.
     pub decrypt: DecryptStatus,
-    /// True when `private_keys.ownPass` was non-empty for this row.
+    /// True when XCA marked this row `ptPrivate` — the key has a
+    /// password of its own and the database password will not open
+    /// it. The GUI uses this to ask for a per-key password.
     pub has_own_pass: bool,
     /// `items.id` of the paired counterpart, when the plugin matched
     /// a cert with its private key (or vice versa) by public-key
@@ -323,14 +325,24 @@ pub fn preview(
                 summary.key_count += 1;
                 let row = read_private_key_row(&conn, &meta);
                 match row {
-                    Ok(Some((blob, has_own_pass))) => {
+                    Ok(Some((blob, pass_type))) => {
+                        let has_own_pass = pass_type == PassType::Private;
                         if has_own_pass {
                             ownpass_keys.push(meta.name.clone());
                         }
-                        let pw = per_key_passwords
-                            .get(&meta.name)
-                            .map(|s| s.as_str())
-                            .or(master_password);
+                        // An explicit per-key password always wins.
+                        // `ptBogus` rows are encrypted under the
+                        // literal string XCA uses for them, and
+                        // everything else is on the database
+                        // password. A `ptPrivate` row falls back to
+                        // the database password only so the failure
+                        // is a clean "password does not match" rather
+                        // than a missing-password stall.
+                        let pw = match per_key_passwords.get(&meta.name) {
+                            Some(p) => Some(p.as_str()),
+                            None if pass_type == PassType::Bogus => Some("Bogus"),
+                            None => master_password,
+                        };
                         match try_decrypt_key(&blob, pw) {
                             Ok((pem, der_opt, status)) => {
                                 if let Some(der) = der_opt.as_deref() {
@@ -513,19 +525,30 @@ fn scan_requires_password(conn: &Connection) -> rusqlite::Result<bool> {
             rusqlite::types::Value::Blob(b) => b,
             _ => continue,
         };
-        if crypto::detect_format(&blob).is_some() {
+        // `Plaintext` needs no password; every other recognised
+        // encoding does. An unrecognised blob is reported as needing
+        // one too — being asked for a password the file cannot use is
+        // a better failure than silently offering an import that
+        // cannot work.
+        if !matches!(crypto::detect_format(&blob), Some(crypto::Format::Plaintext)) {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
+/// Names of the keys XCA marked `ptPrivate` — each has a password of
+/// its own and the database password will not open it.
+///
+/// The column is an INTEGER. The previous `ownPass != ''` test
+/// compared an integer against a string, which SQLite's type ordering
+/// makes unconditionally true, so this returned *every* key.
 fn scan_ownpass_keys(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut out = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT items.name FROM items \
          JOIN private_keys ON private_keys.item = items.id \
-         WHERE private_keys.ownPass IS NOT NULL AND private_keys.ownPass != ''",
+         WHERE private_keys.ownPass = 1",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
@@ -761,10 +784,59 @@ fn read_public_key_item(
     }))
 }
 
+/// XCA's `private_keys.ownPass` column — `pki_key::passType` in XCA's
+/// source, stored as an INTEGER. It says *which* password the row's
+/// blob is encrypted under, and getting it wrong means handing the
+/// database password to a key that never used it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassType {
+    /// `ptCommon` (0) — the database password.
+    Common,
+    /// `ptPrivate` (1) — a password of this key's own. The operator
+    /// has to supply it per key; the database password will not open
+    /// it.
+    Private,
+    /// `ptBogus` (2) — XCA encrypts these under the literal string
+    /// "Bogus", i.e. they are not protected at all.
+    Bogus,
+    /// `ptPin` (3) and anything XCA adds later — token-backed rows
+    /// whose blob is not key material we can import.
+    Other(i64),
+}
+
+impl PassType {
+    fn from_code(code: i64) -> Self {
+        match code {
+            0 => PassType::Common,
+            1 => PassType::Private,
+            2 => PassType::Bogus,
+            n => PassType::Other(n),
+        }
+    }
+
+    /// Read the column defensively: schema 7 and 8 both store an
+    /// INTEGER, but the column is declared without a type affinity in
+    /// some forks and SQLite will hand back TEXT there. A NULL means
+    /// the row predates the column and is on the database password.
+    fn from_value(v: &rusqlite::types::Value) -> Self {
+        match v {
+            rusqlite::types::Value::Integer(i) => PassType::from_code(*i),
+            rusqlite::types::Value::Text(s) => match s.trim().parse::<i64>() {
+                Ok(i) => PassType::from_code(i),
+                // Pre-integer forks stored the marker as a string;
+                // empty means "database password".
+                Err(_) if s.trim().is_empty() => PassType::Common,
+                Err(_) => PassType::Private,
+            },
+            _ => PassType::Common,
+        }
+    }
+}
+
 fn read_private_key_row(
     conn: &Connection,
     meta: &ItemMeta,
-) -> rusqlite::Result<Option<(Vec<u8>, bool)>> {
+) -> rusqlite::Result<Option<(Vec<u8>, PassType)>> {
     let blob = match read_xca_blob_column(
         conn,
         "SELECT private FROM private_keys WHERE item = ?1",
@@ -773,16 +845,15 @@ fn read_private_key_row(
         Some(b) => b,
         None => return Ok(None),
     };
-    let own_pass: Option<String> = conn
-        .query_row(
-            "SELECT ownPass FROM private_keys WHERE item = ?1",
-            [meta.id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten();
-    let has_own_pass = own_pass.map(|s| !s.is_empty()).unwrap_or(false);
-    Ok(Some((blob, has_own_pass)))
+    // Read as a `Value`, not as `Option<String>`: the column is an
+    // INTEGER, so a typed `String` fetch fails, and swallowing that
+    // error made every key look like it was on the database password.
+    let own_pass: rusqlite::types::Value = conn.query_row(
+        "SELECT ownPass FROM private_keys WHERE item = ?1",
+        [meta.id],
+        |r| r.get(0),
+    )?;
+    Ok(Some((blob, PassType::from_value(&own_pass))))
 }
 
 fn try_decrypt_key(
@@ -790,10 +861,28 @@ fn try_decrypt_key(
     password: Option<&str>,
 ) -> Result<(Option<String>, Option<Vec<u8>>, DecryptStatus), String> {
     match crypto::detect_format(blob) {
-        None => {
-            // Treat as plaintext PKCS#8 / SEC1 DER and pass through.
+        Some(crypto::Format::Plaintext) => {
+            // Structurally a bare DER private key: no password
+            // involved, pass it through.
             let pem = pem_wrap("PRIVATE KEY", blob);
             Ok((Some(pem), Some(blob.to_vec()), DecryptStatus::NotEncrypted))
+        }
+        None => {
+            // Refuse. This branch used to wrap the bytes in a
+            // `PRIVATE KEY` PEM and call them plaintext, which is how
+            // an XCA <= 2.4 blob — no magic, no header, so nothing to
+            // detect on — reached the host as raw 3DES ciphertext
+            // labelled as a key. The host then reported it as a
+            // wrong-password decrypt, sending the operator off to
+            // re-type passwords that were never the problem.
+            Err(format!(
+                "unsupported private-key encoding: {} bytes, first byte 0x{:02x}. \
+                 Not a DER private key, and not an XCA encryption envelope this \
+                 plugin recognises. Token-backed (smartcard) keys look like this \
+                 — their material is not in the database.",
+                blob.len(),
+                blob.first().copied().unwrap_or(0)
+            ))
         }
         Some(_) => {
             let Some(pw) = password else {
@@ -801,25 +890,23 @@ fn try_decrypt_key(
             };
             match crypto::decrypt_auto(blob, pw) {
                 Ok(plain) => {
-                    // Sanity-check: AES-CBC + PKCS#7 padding has a
-                    // non-trivial chance (~1/256 to 1/65536 depending
-                    // on byte distribution) of producing valid-padding
-                    // garbage when the key is wrong. Without a content
-                    // check, a wrong-password decrypt of a key
-                    // encrypted with the per-key `ownPass` (XCA's
-                    // mechanism for keys encrypted separately from
-                    // the database master password) silently surfaces
-                    // as "ok" and the host gets random bytes.
+                    // Sanity-check: none of XCA's envelopes carries an
+                    // integrity tag, and CBC + PKCS#7 has a
+                    // non-trivial chance (~1/256) of producing
+                    // valid-padding garbage under the wrong key.
+                    // Without a content check, a wrong-password
+                    // decrypt of a key on its own `ownPass` silently
+                    // surfaces as "ok" and the host gets random bytes.
                     //
                     // Every supported private-key shape — PKCS#8
                     // PrivateKeyInfo, PKCS#1 RSAPrivateKey, SEC1
-                    // ECPrivateKey, raw Ed25519 OneAsymmetricKey —
-                    // starts with a DER SEQUENCE (`0x30`). A first
-                    // byte that isn't `0x30` is a near-certain sign
-                    // the password was wrong; the operator needs to
-                    // supply the per-key password via
-                    // `per_key_passwords`.
-                    if plain.first() != Some(&0x30) {
+                    // ECPrivateKey, raw Ed25519 OneAsymmetricKey — is
+                    // a DER SEQUENCE opening on an INTEGER version and
+                    // spanning the whole plaintext. Checking the
+                    // length too (rather than just the `0x30` tag)
+                    // makes an accidental pass ~2^-24 rather than
+                    // ~1/256.
+                    if !crypto::looks_like_private_key_der(&plain) {
                         // Operator-facing message — keep it plain.
                         // Technical detail (first byte / DER shape) goes in
                         // the host's diagnostic log when the GUI re-shows
@@ -847,7 +934,10 @@ fn classify_failure(reason: &str) -> DecryptStatus {
     let lower = reason.to_ascii_lowercase();
     if lower.contains("missing password") {
         DecryptStatus::MissingPassword
-    } else if lower.contains("wrong password") || lower.contains("decrypt failed") {
+    } else if lower.contains("wrong password")
+        || lower.contains("decrypt failed")
+        || lower.contains("password does not match")
+    {
         DecryptStatus::WrongPassword
     } else if lower.contains("malformed") || lower.contains("unsupported") {
         DecryptStatus::Unsupported
