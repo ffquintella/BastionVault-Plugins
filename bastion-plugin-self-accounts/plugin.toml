@@ -1,0 +1,86 @@
+# BastionVault plugin manifest: self-accounts. See features/self-accounts.md.
+#
+# A credential provider: an operator registers personal accounts (a login plus a
+# password or an SSH key), and Connect offers the matching ones at launch. The
+# host never learns what a "self-account" is; it only knows this plugin declared
+# itself a credential provider and that an administrator approved it.
+
+name        = "self-accounts"
+version     = "0.1.0"
+plugin_type = "secret"
+runtime     = "wasm"
+abi_version = "1.3"
+
+# Filled in by the host on registration.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "Operator-registered accounts (password or SSH key) scoped by resource type, OS, protocol and target, picked at Connect."
+
+[capabilities]
+log_emit   = true
+audit_emit = true
+# The plugin's own keys live under `accounts/…` inside its entity scope.
+storage_prefix = ""
+# ABI 1.3. The host attests the caller and rebases storage onto the caller's
+# entity, so one user's records are unreachable from another user's request
+# whatever this plugin's code does.
+caller_identity = true
+storage_scope   = "entity"
+# Deliberately NO network capability: a compromised build has no egress.
+
+# Approved by an administrator under Plugins → Credentials; the approval is
+# pinned to this block, so editing it (even to narrow it) voids the approval.
+[capabilities.credential_provider]
+display_name = "Self-account"
+selection    = "operator"
+protocols    = ["ssh", "rdp", "web"]
+secret_kinds = ["password", "ssh-key"]
+
+[[config_schema]]
+name        = "allow_ssh_keys"
+label       = "Allow SSH-key accounts"
+description = "Accept accounts whose secret is an SSH private key. Existing key accounts stop being offered when this is off."
+kind        = "bool"
+required    = false
+default     = "true"
+
+[[config_schema]]
+name        = "allow_totp_seeds"
+label       = "Allow TOTP seeds"
+description = "Accept a TOTP seed next to a password (web form logins). Off by default: a record holding both collapses two factors into one."
+kind        = "bool"
+required    = false
+default     = "false"
+
+[[config_schema]]
+name        = "max_accounts_per_user"
+label       = "Accounts per user"
+description = "Upper bound on the accounts one person can register."
+kind        = "int"
+required    = false
+default     = "25"
+
+[[config_schema]]
+name        = "require_connect_mfa"
+label       = "Require connect-time MFA for a release"
+description = "Refuse to release a credential unless the host attests that a connect-time MFA ticket was redeemed for this launch."
+kind        = "bool"
+required    = false
+default     = "true"
+
+[[config_schema]]
+name        = "require_targets"
+label       = "Require targets for"
+description = "Which protocols need a non-empty targets list on an account. An account without one is never offered for them. Targets stop a hostile resource definition from harvesting a credential."
+kind        = "select"
+options     = ["web", "all"]
+required    = false
+default     = "web"
+
+[[config_schema]]
+name        = "allowed_resource_types"
+label       = "Allowed resource types"
+description = "Comma-separated resource type ids accounts may be tagged with. Empty allows every type."
+kind        = "string"
+required    = false

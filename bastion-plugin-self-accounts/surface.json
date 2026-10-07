@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "title": "Self-accounts",
+  "icon": "key-round",
+  "menus": [
+    {
+      "id": "self-accounts.main",
+      "label": "My accounts",
+      "icon": "key-round",
+      "section": "secrets",
+      "route": "/plugin/self-accounts/accounts"
+    }
+  ],
+  "pages": [
+    {
+      "route": "/plugin/self-accounts/accounts",
+      "title": "My accounts",
+      "components": [
+        {
+          "kind": "table",
+          "id": "accounts",
+          "binding": { "op": "list", "path": "{mount}/v2/accounts" },
+          "columns": [
+            { "field": "label", "label": "Label" },
+            { "field": "username", "label": "Login" },
+            { "field": "secret_kind", "label": "Kind" },
+            { "field": "resource_types_text", "label": "Resource types" },
+            { "field": "targets_text", "label": "Targets" },
+            { "field": "last_used_text", "label": "Last used" }
+          ],
+          "row_actions": [
+            {
+              "label": "Delete",
+              "binding": { "op": "delete", "path": "{mount}/v2/accounts/{id}" },
+              "confirm": true
+            }
+          ],
+          "empty_text": "You have no accounts yet. Add one below."
+        },
+        {
+          "kind": "form",
+          "id": "add-password",
+          "title": "Add a password account",
+          "schema": {
+            "type": "object",
+            "required": ["label", "username", "password", "resource_types"],
+            "properties": {
+              "label": { "type": "string", "title": "Label", "description": "Shown in the picker at Connect." },
+              "username": { "type": "string", "title": "Login name" },
+              "domain": { "type": "string", "title": "Domain (RDP and web)" },
+              "password": { "type": "string", "title": "Password", "format": "password", "description": "Write-only. It can be replaced or deleted, never read back." },
+              "secret_kind": { "type": "string", "default": "password", "enum": ["password"], "title": "Kind" },
+              "resource_types": { "type": "array", "title": "Resource types", "x-bv-options": "resource-types" },
+              "os_types": { "type": "array", "title": "OS families (optional)", "x-bv-options": "os-types" },
+              "protocols": { "type": "array", "title": "Protocols (optional)", "items": { "enum": ["ssh", "rdp", "web"] } },
+              "targets": { "type": "string", "title": "Targets", "format": "textarea", "description": "Hosts this account may be used on, comma or newline separated: dc01.corp.example.com, *.corp.example.com, 10.20.0.0/16, https://grafana.corp.example.com. Required for web logins unless the administrator relaxes it." },
+              "totp_seed": { "type": "string", "title": "TOTP seed (web, if the administrator allows it)", "format": "password" },
+              "description": { "type": "string", "title": "Description" }
+            }
+          },
+          "submit": { "label": "Add account", "binding": { "op": "write", "path": "{mount}/v2/accounts" } }
+        },
+        {
+          "kind": "form",
+          "id": "add-ssh-key",
+          "title": "Add an SSH-key account",
+          "schema": {
+            "type": "object",
+            "required": ["label", "username", "private_key", "resource_types"],
+            "properties": {
+              "label": { "type": "string", "title": "Label" },
+              "username": { "type": "string", "title": "Login name" },
+              "secret_kind": { "type": "string", "default": "ssh-key", "enum": ["ssh-key"], "title": "Kind" },
+              "private_key": { "type": "string", "title": "Private key (OpenSSH, unencrypted)", "format": "secret-textarea", "description": "Write-only. Passphrase-protected keys are not accepted." },
+              "resource_types": { "type": "array", "title": "Resource types", "x-bv-options": "resource-types" },
+              "os_types": { "type": "array", "title": "OS families (optional)", "x-bv-options": "os-types" },
+              "targets": { "type": "string", "title": "Targets", "format": "textarea", "description": "Hosts this key may be used on, comma or newline separated." },
+              "description": { "type": "string", "title": "Description" }
+            }
+          },
+          "submit": { "label": "Add key account", "binding": { "op": "write", "path": "{mount}/v2/accounts" } }
+        }
+      ]
+    }
+  ]
+}
