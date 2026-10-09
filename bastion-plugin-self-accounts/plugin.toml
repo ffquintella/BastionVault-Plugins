@@ -6,7 +6,7 @@
 # itself a credential provider and that an administrator approved it.
 
 name        = "self-accounts"
-version     = "0.1.0"
+version     = "0.1.1"
 plugin_type = "secret"
 runtime     = "wasm"
 abi_version = "1.3"
@@ -16,6 +16,14 @@ sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 size   = 0
 
 description = "Operator-registered accounts (password or SSH key) scoped by resource type, OS, protocol and target, picked at Connect."
+
+# `bv-plugin-pack` validates the sibling surface.json, replaces these
+# placeholders with its actual content address, and emits a surface-bearing
+# v2 bundle. The host verifies the same values again during registration.
+[surface]
+schema_version = 1
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size = 0
 
 [capabilities]
 log_emit   = true

@@ -53,7 +53,13 @@ fn surface() -> SurfaceManifest {
 
 #[test]
 fn surface_validates_for_this_plugin() {
-    surface().validate("self-accounts", &BTreeSet::new()).expect("surface validates");
+    let manifest = manifest();
+    let declared = manifest.surface.expect("plugin.toml declares its management surface");
+    let surface = surface();
+    assert_eq!(declared.schema_version, surface.schema_version);
+    assert_eq!(declared.sha256, "0".repeat(64), "the packer stamps the shipped bytes");
+    assert_eq!(declared.size, 0, "the packer stamps the shipped bytes");
+    surface.validate("self-accounts", &BTreeSet::new()).expect("surface validates");
 }
 
 #[test]

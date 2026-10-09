@@ -9,9 +9,9 @@ target hosts it applies to, and later picks one when pressing **Connect**. The
 host never learns what a self-account is; it only knows this plugin declared
 itself a credential provider and that an administrator approved it.
 
-> **Status.** Phase 2 of 5: the plugin itself. Connect does not use it yet (the
-> `provider` credential source, the picker and the release paths are Phases 3
-> and 4), so today it is a personal store with a management page, nothing more.
+> **Status.** The plugin, Connect integration and management surface are
+> implemented. The feature review gate and live per-platform checks remain
+> open; see `features/self-accounts.md`.
 
 ## Security model
 
@@ -102,20 +102,18 @@ instantiate (the catalog refuses such a module at registration).
 
 Then, as an administrator:
 
-1. Register the plugin (**Plugins → Register**, or `POST /v1/sys/plugins`) and
-   mount it: `bvault write sys/mounts/self-accounts type=plugin:self-accounts`.
+1. Build a signed bundle with `make plugins-sign`, register
+   `plugins-ext/dist/bastion-plugin-self-accounts.bvplugin` under
+   **Plugins → Register**, and mount it:
+   `bvault write sys/mounts/self-accounts type=plugin:self-accounts`. The v2
+   bundle carries the validated management surface; after the remaining steps,
+   **My Profile → Accounts for Connect → My accounts** opens it.
 2. Approve it under **Plugins → Credentials**
    (`PUT v2/sys/plugins/self-accounts/grants/credential-provider`). Until you do,
    nothing can ask it for a credential.
 3. Attach the policy below to the people who may keep accounts. It is not added
    to `default` automatically: installing a plugin must not silently widen a
    built-in policy.
-4. To get the **My accounts** page, register `surface.json` with the plugin: add
-   a `[surface]` table (`schema_version = 1`, the file's `sha256` and `size`) to
-   `plugin.toml` before packing and signing, then send the file as `surface_b64`
-   on `POST /v1/sys/plugins`. The packer cannot embed it yet, and the GUI's
-   Register dialog does not send it; `surface_b64` without a `[surface]` table is
-   ignored. See `docs/self-accounts.md` §2.3.
 
 ```hcl
 # self-accounts-user
