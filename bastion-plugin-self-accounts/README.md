@@ -50,7 +50,7 @@ All paths are `v2/` under the mount (`self-accounts/` by convention; mount with
 |---|---|---|
 | `v2/accounts` | `list` | The caller's accounts, as `data.entries` (metadata only). |
 | `v2/accounts` | `write` | Create. Returns `data.id`; `warnings` lists accounts that would never be offered. |
-| `v2/accounts/<id>` | `read` | Metadata plus `has_secret`. Never the secret. |
+| `v2/accounts/<id>` | `read` | Metadata plus `has_secret`, and the applicability lists flat as well (`resource_types`, `os_types`, `protocols`, `targets`) for the Edit form. Never the secret. |
 | `v2/accounts/<id>` | `write` | Update. Absent or empty secret fields keep the stored secret. Changing `secret_kind` needs the new secret in the same write. |
 | `v2/accounts/<id>/totp` | `delete` | Clear the TOTP seed. |
 | `v2/accounts/<id>` | `delete` | Delete the account. |
@@ -125,10 +125,29 @@ path "self-accounts/v2/settings"   { capabilities = ["read"] }
 Granting it broadly is safe because the host scopes storage per entity, not
 because of the path.
 
+## Management page
+
+**My accounts** lists your accounts. **Add account** asks for the kind (password
+or SSH key) and opens that kind's form in a dialog. **Edit** on a row opens the
+form for the row's kind, filled from `read v2/accounts/<id>`, and saves with
+`write v2/accounts/<id>`:
+
+- The secret fields (password, TOTP seed, private key) start empty and are
+  optional. Leave one empty to keep the stored secret; it is not sent at all.
+  The page never receives a secret, so it cannot show one.
+- The kind is fixed. To turn a password account into a key account, delete it
+  and add a new one, or write `secret_kind` with the new secret through the API.
+- Warnings from a save (for example, an account that would never be offered) are
+  shown in the dialog before it closes.
+
+The page uses surface schema 2 (modal forms), so this version needs a host and a
+desktop app that render schema 2; an older host refuses the bundle at
+registration.
+
 ## Known limits
 
-- The management page adds and deletes accounts; **editing** one goes through the
-  API (`write v2/accounts/<id>`), because a surface row action cannot open a form.
+- Clearing a TOTP seed goes through the API (`DELETE v2/accounts/<id>/totp`);
+  the Edit form can only replace it.
 - Passphrase-protected SSH keys are refused. PKCS#8 keys are refused too: this
   version stores OpenSSH keys, the form the SSH session reads.
 - The password form always shows a TOTP field; a seed is refused with a clear

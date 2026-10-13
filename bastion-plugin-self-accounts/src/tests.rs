@@ -141,6 +141,50 @@ fn crud_round_trip_never_returns_a_secret() {
     assert!(call("list", "v2/accounts", json!({})).1["data"]["entries"].as_array().unwrap().is_empty());
 }
 
+/// The management page's Edit form is prefilled from `read`, and its fields are
+/// flat; the round trip read → form → write must not change the record.
+#[test]
+#[serial]
+fn read_carries_the_edit_forms_flat_lists_and_no_secret() {
+    setup();
+    host::set_config("allow_totp_seeds", "true");
+    let id = create(pw_account(json!({ "protocols": ["rdp", "web"], "totp_seed": "JBSWY3DPEHPK3PXP", "targets": "*.corp.example.com, https://grafana.corp.example.com" })));
+    let (_, v, raw) = call("read", &format!("v2/accounts/{id}"), json!({}));
+    let d = &v["data"];
+    assert_eq!(d["resource_types"], json!(["server"]));
+    assert_eq!(d["os_types"], json!(["windows"]));
+    assert_eq!(d["protocols"], json!(["rdp", "web"]));
+    assert_eq!(d["targets"], json!(["*.corp.example.com", "https://grafana.corp.example.com"]));
+    assert_eq!(d["applies_to"]["targets"], d["targets"], "the nested block is unchanged");
+    let text = String::from_utf8_lossy(&raw);
+    for secret in ["hunter2-S3CRET", "JBSWY3DPEHPK3PXP"] {
+        assert!(!text.contains(secret));
+    }
+    for key in ["password", "private_key", "totp_seed"] {
+        assert!(d.get(key).is_none(), "{key}");
+    }
+    // `list` rows stay as they were.
+    let (_, l, _) = call("list", "v2/accounts", json!({}));
+    assert!(l["data"]["entries"][0].get("targets").is_none());
+
+    // What the Edit form submits back: the prefilled fields, the targets joined
+    // one per line, and no secret at all. Nothing changes and the secrets stay.
+    let edit = json!({
+        "label": d["label"], "username": d["username"], "domain": d["domain"], "description": d["description"],
+        "resource_types": d["resource_types"], "os_types": d["os_types"], "protocols": d["protocols"],
+        "targets": d["targets"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect::<Vec<_>>().join("\n"),
+    });
+    let (st, _, raw) = call("write", &format!("v2/accounts/{id}"), edit);
+    assert_eq!(st, 0, "{}", String::from_utf8_lossy(&raw));
+    let (_, after, _) = call("read", &format!("v2/accounts/{id}"), json!({}));
+    for key in ["label", "username", "domain", "applies_to", "secret_kind", "has_totp"] {
+        assert_eq!(after["data"][key], d[key], "{key}");
+    }
+    let (st, rel, _) = release(&id, &rdp_q(), true, false);
+    assert_eq!(st, 0);
+    assert_eq!(rel["data"]["secret"]["password"], "hunter2-S3CRET");
+}
+
 #[test]
 #[serial]
 fn metadata_key_never_holds_secret_bytes() {

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "title": "Self-accounts",
   "icon": "key-round",
   "menus": [
@@ -28,19 +28,31 @@
             { "field": "targets_text", "label": "Targets" },
             { "field": "last_used_text", "label": "Last used" }
           ],
+          "actions": [
+            { "label": "Add account", "prompt": "What kind of account?", "forms": ["add-password", "add-ssh-key"] }
+          ],
           "row_actions": [
+            {
+              "label": "Edit",
+              "binding": { "op": "read", "path": "{mount}/v2/accounts/{id}" },
+              "open_form": {
+                "select_by": "secret_kind",
+                "forms_by_value": { "password": "edit-password", "ssh-key": "edit-ssh-key" }
+              }
+            },
             {
               "label": "Delete",
               "binding": { "op": "delete", "path": "{mount}/v2/accounts/{id}" },
               "confirm": true
             }
           ],
-          "empty_text": "You have no accounts yet. Add one below."
+          "empty_text": "You have no accounts yet. Use Add account to register one."
         },
         {
           "kind": "form",
           "id": "add-password",
           "title": "Add a password account",
+          "presentation": "modal",
           "schema": {
             "type": "object",
             "required": ["label", "username", "password", "resource_types"],
@@ -64,6 +76,7 @@
           "kind": "form",
           "id": "add-ssh-key",
           "title": "Add an SSH-key account",
+          "presentation": "modal",
           "schema": {
             "type": "object",
             "required": ["label", "username", "private_key", "resource_types"],
@@ -79,6 +92,49 @@
             }
           },
           "submit": { "label": "Add key account", "binding": { "op": "write", "path": "{mount}/v2/accounts" } }
+        },
+        {
+          "kind": "form",
+          "id": "edit-password",
+          "title": "Edit password account",
+          "presentation": "modal",
+          "schema": {
+            "type": "object",
+            "required": ["label", "username", "resource_types"],
+            "properties": {
+              "label": { "type": "string", "title": "Label", "description": "Shown in the picker at Connect." },
+              "username": { "type": "string", "title": "Login name" },
+              "domain": { "type": "string", "title": "Domain (RDP and web)" },
+              "password": { "type": "string", "title": "Password", "format": "password", "description": "Write-only. Type a new password to replace it." },
+              "resource_types": { "type": "array", "title": "Resource types", "x-bv-options": "resource-types" },
+              "os_types": { "type": "array", "title": "OS families (optional)", "x-bv-options": "os-types" },
+              "protocols": { "type": "array", "title": "Protocols (optional)", "items": { "enum": ["ssh", "rdp", "web"] } },
+              "targets": { "type": "string", "title": "Targets", "format": "textarea", "description": "Hosts this account may be used on, comma or newline separated: dc01.corp.example.com, *.corp.example.com, 10.20.0.0/16, https://grafana.corp.example.com. Required for web logins unless the administrator relaxes it." },
+              "totp_seed": { "type": "string", "title": "TOTP seed (web, if the administrator allows it)", "format": "password", "description": "Write-only. Type a new seed to replace it." },
+              "description": { "type": "string", "title": "Description" }
+            }
+          },
+          "submit": { "label": "Save changes", "binding": { "op": "write", "path": "{mount}/v2/accounts/{id}" } }
+        },
+        {
+          "kind": "form",
+          "id": "edit-ssh-key",
+          "title": "Edit SSH-key account",
+          "presentation": "modal",
+          "schema": {
+            "type": "object",
+            "required": ["label", "username", "resource_types"],
+            "properties": {
+              "label": { "type": "string", "title": "Label" },
+              "username": { "type": "string", "title": "Login name" },
+              "private_key": { "type": "string", "title": "Private key (OpenSSH, unencrypted)", "format": "secret-textarea", "description": "Write-only. Paste a new key to replace it; passphrase-protected keys are not accepted." },
+              "resource_types": { "type": "array", "title": "Resource types", "x-bv-options": "resource-types" },
+              "os_types": { "type": "array", "title": "OS families (optional)", "x-bv-options": "os-types" },
+              "targets": { "type": "string", "title": "Targets", "format": "textarea", "description": "Hosts this key may be used on, comma or newline separated." },
+              "description": { "type": "string", "title": "Description" }
+            }
+          },
+          "submit": { "label": "Save changes", "binding": { "op": "write", "path": "{mount}/v2/accounts/{id}" } }
         }
       ]
     }

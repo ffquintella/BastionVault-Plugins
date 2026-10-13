@@ -71,27 +71,83 @@ fn surface_binds_only_this_plugins_v2_paths() {
     assert!(!s.contains("/v1/"));
 }
 
+fn components() -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(include_str!("../surface.json")).unwrap();
+    v["pages"][0]["components"].as_array().unwrap().clone()
+}
+
+fn form(id: &str) -> serde_json::Value {
+    components()
+        .into_iter()
+        .find(|c| c["kind"] == "form" && c["id"] == id)
+        .unwrap_or_else(|| panic!("form {id}"))
+}
+
 #[test]
 fn password_and_key_forms_use_the_write_only_widgets() {
-    let v: serde_json::Value = serde_json::from_str(include_str!("../surface.json")).unwrap();
-    let forms: Vec<&serde_json::Value> = v["pages"][0]["components"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|c| c["kind"] == "form")
-        .collect();
-    assert_eq!(forms.len(), 2);
-    let pw = &forms[0]["schema"]["properties"];
-    assert_eq!(pw["password"]["format"], "password");
-    assert_eq!(pw["totp_seed"]["format"], "password");
-    let key = &forms[1]["schema"]["properties"];
-    assert_eq!(key["private_key"]["format"], "secret-textarea");
+    let forms: Vec<serde_json::Value> = components().into_iter().filter(|c| c["kind"] == "form").collect();
+    assert_eq!(forms.len(), 4);
     for f in &forms {
-        assert_eq!(f["schema"]["properties"]["resource_types"]["x-bv-options"], "resource-types");
+        let p = &f["schema"]["properties"];
+        assert_eq!(p["resource_types"]["x-bv-options"], "resource-types", "{}", f["id"]);
         assert_eq!(f["submit"]["binding"]["op"], "write");
+        // Every form is opened in a modal; nothing is rendered inline.
+        assert_eq!(f["presentation"], "modal", "{}", f["id"]);
+        if p.get("password").is_some() {
+            assert_eq!(p["password"]["format"], "password");
+            assert_eq!(p["totp_seed"]["format"], "password");
+        }
+        if p.get("private_key").is_some() {
+            assert_eq!(p["private_key"]["format"], "secret-textarea");
+        }
     }
-    // Only the delete row action, behind a confirm.
-    let t = &v["pages"][0]["components"][0];
-    assert_eq!(t["row_actions"].as_array().unwrap().len(), 1);
-    assert_eq!(t["row_actions"][0]["confirm"], true);
+    assert!(form("add-password")["schema"]["properties"]["password"].is_object());
+    assert!(form("add-ssh-key")["schema"]["properties"]["private_key"].is_object());
+}
+
+#[test]
+fn add_account_offers_a_kind_chooser() {
+    let t = &components()[0];
+    assert_eq!(t["kind"], "table");
+    let actions = t["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["label"], "Add account");
+    assert_eq!(actions[0]["forms"], serde_json::json!(["add-password", "add-ssh-key"]));
+    for id in ["add-password", "add-ssh-key"] {
+        assert_eq!(form(id)["submit"]["binding"]["path"], "{mount}/v2/accounts");
+    }
+    assert_eq!(form("add-password")["schema"]["properties"]["secret_kind"]["enum"], serde_json::json!(["password"]));
+    assert_eq!(form("add-ssh-key")["schema"]["properties"]["secret_kind"]["enum"], serde_json::json!(["ssh-key"]));
+}
+
+#[test]
+fn edit_opens_the_form_for_the_rows_kind_and_never_requires_or_changes_the_secret() {
+    let t = &components()[0];
+    let row_actions = t["row_actions"].as_array().unwrap();
+    assert_eq!(row_actions.len(), 2);
+    let edit = &row_actions[0];
+    assert_eq!(edit["label"], "Edit");
+    // The binding is the prefill read; the API never returns a secret on it.
+    assert_eq!(edit["binding"], serde_json::json!({ "op": "read", "path": "{mount}/v2/accounts/{id}" }));
+    assert_eq!(edit["open_form"]["select_by"], "secret_kind");
+    let by_kind = &edit["open_form"]["forms_by_value"];
+    // One edit form per secret kind the provider declares, so the kind is
+    // fixed by the row.
+    let declared = manifest().capabilities.credential_provider.unwrap().secret_kinds;
+    assert_eq!(by_kind.as_object().unwrap().len(), declared.len());
+    for kind in &declared {
+        let f = form(by_kind[kind.as_str()].as_str().unwrap());
+        assert_eq!(f["submit"]["binding"]["path"], "{mount}/v2/accounts/{id}");
+        let props = f["schema"]["properties"].as_object().unwrap();
+        assert!(!props.contains_key("secret_kind"), "{kind}: the kind cannot change on edit");
+        let required: Vec<&str> =
+            f["schema"]["required"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+        for secret in ["password", "private_key", "totp_seed"] {
+            assert!(!required.contains(&secret), "{kind}: {secret} must stay optional on edit");
+        }
+    }
+    // Delete is unchanged, behind a confirm.
+    assert_eq!(row_actions[1]["label"], "Delete");
+    assert_eq!(row_actions[1]["binding"]["op"], "delete");
+    assert_eq!(row_actions[1]["confirm"], true);
 }

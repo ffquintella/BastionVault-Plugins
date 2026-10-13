@@ -87,7 +87,19 @@ fn list(host: &Host) -> Response {
 
 fn read(host: &Host, id: &str) -> Response {
     match store::load_meta(host, id) {
-        Ok(Some(m)) => reply(view(&m), vec![]),
+        Ok(Some(m)) => {
+            let mut v = view(&m);
+            // The management page's Edit form is prefilled from this read, and a
+            // surface form's fields are flat (what it submits), so the lists are
+            // carried at the top level too. Metadata only, like the rest.
+            if let Some(o) = v.as_object_mut() {
+                o.insert("resource_types".into(), json!(m.applies_to.resource_types));
+                o.insert("os_types".into(), json!(m.applies_to.os_types));
+                o.insert("protocols".into(), json!(m.applies_to.protocols));
+                o.insert("targets".into(), json!(m.applies_to.targets));
+            }
+            reply(v, vec![])
+        }
         Ok(None) => not_found(),
         Err(e) => invalid(e),
     }
