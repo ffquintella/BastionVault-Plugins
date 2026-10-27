@@ -2,7 +2,7 @@
 //!
 //! See `features/xca-import.md` in the host repo for the spec.
 //!
-//! ## Wire protocol (recap — same as `bastion-plugin-postgres`)
+//! ## Wire protocol (recap — same as the other process plugins)
 //!
 //! 1. Host writes one init line:
 //!    `{"type":"init","token":"...","input":"<base64 JSON>","plugin_name":"..."}`
