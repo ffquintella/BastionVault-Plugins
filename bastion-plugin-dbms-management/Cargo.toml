@@ -1,0 +1,64 @@
+[package]
+name = "bastion-plugin-dbms-management"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SQL browser sessions on database resources: every statement classified, authorized by the vault, executed and audited. BastionVault process plugin (ABI 1.4). See features/sql-browser.md (S109)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bastion-plugin-dbms-management"
+path = "src/main.rs"
+
+[dependencies]
+# The process runner (multiplexed ABI 1.4 protocol, lifecycle messages) and
+# typed caller-bound host calls.
+bastion-plugin-sdk = { path = "../../crates/bastion-plugin-sdk", features = ["process"] }
+# The statement classifier (features/sql-browser.md §4). Pure, no I/O. The
+# vault server does not link it; this plugin is its only production user.
+bv-sql-classify = { path = "../../crates/bv-sql-classify" }
+# Plugin-authored SQL (catalog reads, structured row edits) is built only from
+# literals and allow-listed identifiers (§7); user SQL never goes through it.
+bv-sql-guard = { path = "../../crates/bv-sql-guard" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Sessions and runs outlive the invocation that started them (§6.2): the
+# database work runs on this runtime, between invocations.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+# PostgreSQL driver (Phase 0 item 4). No `with-*` features and no TLS
+# feature: TLS is the rustls connector in src/tls.rs, so neither openssl-sys
+# nor native-tls enters the graph. Same line as dynamic-engine-plugins/.
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+# Row streams are polled with StreamExt; already in the graph through
+# tokio-postgres.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# TLS to the database on the `ring` provider: the default `aws_lc_rs` provider
+# would pull aws-lc-sys, which plugins-ext/ does not carry (its lock has none).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The OS trust store for verify-full / verify-ca profiles without a CA bundle.
+# Same version line as dynamic-engine-plugins/bastion-plugin-postgres.
+rustls-native-certs = "0.8"
+# Session ids (256 random bits) and the statement / key digests (HMAC-SHA256)
+# from the vetted primitives rustls already links; no new crypto crate.
+ring = "0.17"
+# The released database password lives in zeroized buffers only.
+zeroize = { version = "1", features = ["alloc"] }
+# Binary cells are returned as base64 (§6.3).
+base64 = "0.22"
+
+[dev-dependencies]
+bastion-plugin-testkit = { path = "../../crates/bastion-plugin-testkit" }
+# plugin.toml is checked against the host's own manifest rules.
+bv_plugin_manifest = { path = "../../crates/bv-plugin-manifest" }
+toml = "1.1"
+# Test certificates for the TLS-mode tests, on ring (not aws-lc-rs).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,36 @@
+# BastionVault plugin manifest: dbms-management (features/sql-browser.md, S109).
+#
+# A SQL browser on `database` resources. Every statement is classified here,
+# authorized by the vault (`resource_sql_authorize`), run with a login the host
+# releases (`resource_sql_credential`) and audited with a host-stamped actor.
+
+name        = "dbms-management"
+version     = "0.1.0"
+plugin_type = "sql-browser"
+runtime     = "process"
+abi_version = "1.4"
+
+# Filled in by the host on registration.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size   = 0
+
+description = "SQL browser: PostgreSQL sessions where every statement is classified, authorized by BastionVault and audited; the database login never leaves the server."
+
+[capabilities]
+# Sessions hold a live database connection between invocations (§6.1).
+long_lived      = true
+# Multiplexed invocations; only a multiplexed child receives the seal message.
+concurrent      = true
+caller_identity = true
+log_emit        = true
+audit_emit      = true
+# Journal, config and the digest key (§11, §12).
+storage_prefix  = "dbms/"
+# resource_sql_target / _authorize / connect_ticket_redeem (grant `sql-gate`).
+sql_gate        = true
+# resource_sql_credential (grant `resource-credentials`, pinned to this block).
+resource_credentials = ["sql"]
+# The GUI renders its SQL workspace against this plugin's mounts (§10).
+sql_console     = true
+# No egress is declared: the endpoint comes from the host, and the plugin
+# enforces `allowed_networks` itself after DNS (§12).
