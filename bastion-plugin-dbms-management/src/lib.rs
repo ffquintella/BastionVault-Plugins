@@ -1,5 +1,5 @@
 //! `dbms-management`: the SQL browser's server half (features/sql-browser.md,
-//! S109, T125 Phase 3). A long-lived, multiplexed process plugin. Sessions
+//! S109, T125 Phase 3; scripts, exports and per-action step-up T126 Phase 5). A long-lived, multiplexed process plugin. Sessions
 //! hold a PostgreSQL connection opened with a login the host releases; every
 //! statement is classified (`bv-sql-classify`), authorized by the vault
 //! (`resource_sql_authorize`), executed through `driver::PgConn`, and audited.
@@ -11,6 +11,7 @@ pub mod audit;
 pub mod authz;
 pub mod config;
 pub mod driver;
+pub mod export;
 pub mod host;
 pub mod ids;
 pub mod journal;
@@ -218,9 +219,11 @@ impl Plugin {
                         Ok(json!({"session_id": s.id, "closed": true}))
                     }
                     (Op::Write, ["execute"]) => session::execute(&cx, &s, &req.data),
-                    (Op::Write, ["script"]) | (Op::Write, ["export"]) | (Op::Read, ["exports", ..]) => Err(
-                        ApiError::unsupported("scripts and exports arrive with T126 (features/sql-browser.md Phase 5)"),
-                    ),
+                    (Op::Write, ["script"]) => session::script(&cx, &s, &req.data),
+                    (Op::Write, ["export"]) => session::export(&cx, &s, &req.data),
+                    (Op::Read, ["exports", job]) => session::export_status(&cx, &s, job),
+                    (Op::Read, ["exports", job, offset]) => session::export_pull(&cx, &s, job, offset),
+                    (Op::Write, ["exports", job, "cancel"]) => session::export_cancel(&cx, &s, job),
                     (Op::Read, ["runs", run]) => session::page(&cx, &s, run),
                     (Op::Write, ["runs", run, "cancel"]) => session::cancel(&cx, &s, run),
                     (Op::List | Op::Read, ["objects"]) => objects::schemas(&cx, &s),

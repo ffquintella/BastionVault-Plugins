@@ -28,8 +28,12 @@ host-stamped actor.
 `config` · `sessions` · `sessions/<id>` · `sessions/<id>/execute` ·
 `sessions/<id>/runs/<run>` · `sessions/<id>/runs/<run>/cancel` ·
 `sessions/<id>/objects[/<schema>[/<object>]]` · `sessions/<id>/rows` ·
-`sessions/<id>/ceiling` · `journal/self/…` · `journal/all/…`.
-Scripts and exports arrive with T126.
+`sessions/<id>/ceiling` · `sessions/<id>/script` · `sessions/<id>/export` ·
+`sessions/<id>/exports/<job>[/<offset>|/cancel]` · `journal/self/…` ·
+`journal/all/…`. Scripts need `sql_script`, exports `sql_export`, and a
+profile's `step_up` list asks for an action-bound MFA ticket
+(`step_up_ticket`) before a request uses one of its capabilities (T126,
+Phase 5).
 
 ## Tests
 

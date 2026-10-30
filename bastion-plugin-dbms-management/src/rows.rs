@@ -52,7 +52,7 @@ pub struct Edit {
     pub original: BTreeMap<String, Value>,
 }
 
-const KEYS: [&str; 5] = ["object", "op", "key", "values", "original"];
+const KEYS: [&str; 6] = ["object", "op", "key", "values", "original", "step_up_ticket"];
 
 fn ident(s: &str, what: &str) -> Result<SqlIdent, ApiError> {
     SqlIdent::new(s).map_err(|_| {
@@ -203,6 +203,13 @@ fn db(e: DbError) -> ApiError {
 /// `POST v2/sessions/<id>/rows`.
 pub fn apply(cx: &Ctx<'_>, s: &Arc<Session>, data: &Map<String, Value>) -> Result<Value, ApiError> {
     let edit = Edit::parse(data)?;
+    let ticket = match data.get("step_up_ticket") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) if !t.is_empty() && t.len() <= 256 && !t.chars().any(char::is_control) => {
+            Some(t.as_str())
+        }
+        Some(_) => return Err(ApiError::bad_request("`step_up_ticket` must be 1-256 printable characters")),
+    };
     s.touch();
     // Exclusive: no run or other edit may interleave with the edit's
     // BEGIN … COMMIT (or savepoint) bracket on the session's connection.
@@ -246,6 +253,11 @@ pub fn apply(cx: &Ctx<'_>, s: &Arc<Session>, data: &Map<String, Value>) -> Resul
             );
         }
     };
+    // Per-action step-up (§8.3): the edit's capability and `sql_select`.
+    let caps: std::collections::BTreeSet<&'static str> = [edit.op.capability(), "sql_select"].into_iter().collect();
+    if let Some(reply) = crate::session::step_up(cx, s, &caps, ticket)? {
+        return Ok(reply);
+    }
     let in_tx = tx == TxStatus::InTransaction;
     let (open, keep, undo) = if in_tx {
         (

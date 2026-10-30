@@ -749,3 +749,482 @@ fn live_aborted_transaction_recovers_after_rollback() {
     let (_, pages) = exec(&p, &rw, "lea", &sid, "SELECT id FROM t ORDER BY id");
     assert_eq!(rows(&pages), vec![json!([1]), json!([2])]);
 }
+
+// ── T126: scripts, exports, per-action step-up ──────────────────────────
+
+/// Poll a run to its end.
+fn poll(p: &Plugin, h: &MockHost, who: &str, sid: &str, run: &str) -> Vec<Value> {
+    let mut pages = Vec::new();
+    let t0 = Instant::now();
+    loop {
+        let (st, page, bytes) = call(p, h, who, "read", &format!("v2/sessions/{sid}/runs/{run}"), json!({}));
+        assert_eq!(st, 0, "{page}");
+        h.assert_no_leak(&bytes);
+        let page = page["data"].clone();
+        let done = page["state"] != "running" && page["has_more"] == false;
+        pages.push(page);
+        if done {
+            return pages;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "run did not finish");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// `POST script` and, when it started, poll it to the end.
+fn script(p: &Plugin, h: &MockHost, who: &str, sid: &str, body: Value) -> (Value, Vec<Value>) {
+    let (_, v, bytes) = call(p, h, who, "write", &format!("v2/sessions/{sid}/script"), body);
+    h.assert_no_leak(&bytes);
+    if v["data"]["state"] != "running" {
+        return (v, Vec::new());
+    }
+    let run = v["data"]["run_id"].as_str().unwrap().to_string();
+    let pages = poll(p, h, who, sid, &run);
+    (v, pages)
+}
+
+/// `POST export` and, when it started, pull every chunk: (start reply, the
+/// bytes, the last pull).
+fn export(p: &Plugin, h: &MockHost, who: &str, sid: &str, body: Value) -> (Value, Vec<u8>, Value) {
+    use base64::Engine as _;
+    let (_, v, bytes) = call(p, h, who, "write", &format!("v2/sessions/{sid}/export"), body);
+    h.assert_no_leak(&bytes);
+    if v["data"]["state"] != "running" {
+        return (v, Vec::new(), Value::Null);
+    }
+    let job = v["data"]["job"].as_str().unwrap().to_string();
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    loop {
+        let (st, chunk, bytes) =
+            call(p, h, who, "read", &format!("v2/sessions/{sid}/exports/{job}/{}", out.len()), json!({}));
+        assert_eq!(st, 0, "{chunk}");
+        h.assert_no_leak(&bytes);
+        let c = chunk["data"].clone();
+        assert!(c["length"].as_u64().unwrap() <= crate::export::CHUNK_BYTES as u64);
+        out.extend(base64::engine::general_purpose::STANDARD.decode(c["chunk"].as_str().unwrap()).unwrap());
+        if c["eof"] == true {
+            return (v, out, c);
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "export did not finish");
+    }
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    crate::ids::hex(ring::digest::digest(&ring::digest::SHA256, b).as_ref())
+}
+
+/// The profiles' `step_up` lists, as the host's target view carries them.
+fn set_step_up(h: &MockHost, step_up: &[&str]) {
+    let mut t = h.target.lock().unwrap();
+    let target = t.as_mut().unwrap();
+    for p in target["target"]["profiles"].as_array_mut().unwrap() {
+        p["step_up"] = json!(step_up);
+    }
+}
+
+#[test]
+#[ignore = "needs docker; run with --run-ignored"]
+fn live_exports() {
+    let Some(fx) = fixture() else { return };
+    let p = Plugin::new();
+
+    // ── sql_select alone: refused, nothing read
+    let ana = fx.host(&["sql_select"], "disable");
+    let sid = open(&p, &ana, "ana");
+    let (v, _, _) = export(&p, &ana, "ana", &sid, json!({"sql": "SELECT * FROM public.t", "format": "csv"}));
+    assert_eq!(v["data"]["state"], "refused", "{v}");
+    assert!(v["data"]["message"].as_str().unwrap().contains("sql_export"), "{v}");
+    assert!(ana.audit_events().iter().any(|e| e["event"] == "dbms.export" && e["outcome"] == "refused"));
+
+    // ── sql_select + sql_export: CSV, pulled in chunks, hashed, audited
+    let exp = fx.host(&["sql_select", "sql_export"], "disable");
+    let sid = open(&p, &exp, "erin");
+    let sql = "SELECT id, name, amount, '=1+1' AS f FROM t ORDER BY id";
+    let (v, bytes, end) = export(&p, &exp, "erin", &sid, json!({"sql": sql, "format": "csv"}));
+    assert_eq!(v["data"]["state"], "running", "{v}");
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert_eq!(text, "\"id\",\"name\",\"amount\",\"f\"\r\n1,\"alpha\",10.50,\"'=1+1\"\r\n2,\"beta\",,\"'=1+1\"\r\n");
+    assert_eq!((end["state"].clone(), end["rows"].clone()), (json!("done"), json!(2)));
+    assert_eq!(end["sha256"], json!(sha256_hex(&bytes)));
+    let asked = exp.authorized.lock().unwrap().last().unwrap().clone();
+    assert!(asked.contains(&crate::host::Check::object("sql_export", "app", "public", "t")), "{asked:?}");
+    let ev = exp.audit_events().into_iter().rev().find(|e| e["event"] == "dbms.export").unwrap();
+    assert_eq!((ev["outcome"].clone(), ev["rows"].clone()), (json!("done"), json!(2)));
+    assert_eq!(ev["sha256"], json!(sha256_hex(&bytes)));
+    assert_eq!(ev["bytes"], json!(bytes.len()));
+    assert!(ev["digest"].as_str().is_some_and(|d| d.len() == 64));
+    assert!(!ev.to_string().contains("alpha"), "no row data in the audit");
+
+    // ── JSON Lines and SQL INSERT
+    let (_, bytes, _) = export(
+        &p,
+        &exp,
+        "erin",
+        &sid,
+        json!({"sql": "SELECT id, name, amount FROM public.t ORDER BY id", "format": "jsonl"}),
+    );
+    assert_eq!(
+        String::from_utf8(bytes).unwrap(),
+        "{\"id\":1,\"name\":\"alpha\",\"amount\":\"10.50\"}\n{\"id\":2,\"name\":\"beta\",\"amount\":null}\n"
+    );
+    let body = json!({"sql": "SELECT id, name FROM public.t ORDER BY id", "format": "sql-insert",
+        "table": {"schema": "public", "name": "t_copy"}});
+    let (_, bytes, _) = export(&p, &exp, "erin", &sid, body);
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("INSERT INTO \"public\".\"t_copy\" (\"id\", \"name\") VALUES (1, 'alpha');\n"), "{text}");
+
+    // ── a row limit stops the read and says so; a large export streams in
+    //    1 MiB chunks from the cursor
+    let (_, bytes, end) = export(
+        &p,
+        &exp,
+        "erin",
+        &sid,
+        json!({"sql": "SELECT g FROM generate_series(1, 100) g", "format": "csv", "max_rows": 10}),
+    );
+    assert_eq!(
+        (end["state"].clone(), end["limit"].clone(), end["rows"].clone()),
+        (json!("limit_reached"), json!("row_limit"), json!(10))
+    );
+    assert_eq!(String::from_utf8(bytes).unwrap().lines().count(), 11);
+    let (_, bytes, end) = export(
+        &p,
+        &exp,
+        "erin",
+        &sid,
+        json!({"sql": "SELECT g, repeat('x', 200) FROM generate_series(1, 20000) g", "format": "csv"}),
+    );
+    assert_eq!(end["rows"], 20000);
+    assert!(bytes.len() > 2 * crate::export::CHUNK_BYTES, "{}", bytes.len());
+    assert_eq!(end["sha256"], json!(sha256_hex(&bytes)));
+
+    // ── only SELECT-only statements, refused before the database
+    for sql in [
+        "DELETE FROM public.canary RETURNING *",
+        "WITH d AS (DELETE FROM public.canary RETURNING *) SELECT * FROM d",
+        "SELECT * FROM public.canary FOR UPDATE",
+        "SELECT 1; SELECT 2",
+    ] {
+        let (_, v, _) =
+            call(&p, &exp, "erin", "write", &format!("v2/sessions/{sid}/export"), json!({"sql": sql, "format": "csv"}));
+        assert!(matches!(code(&v).as_str(), "export_not_select" | "export_one_statement" | "use_script"), "{sql}: {v}");
+    }
+    assert_eq!(fx.canary(), "intact");
+
+    // ── malformed requests and pulls
+    for body in [
+        json!({"sql": "SELECT 1", "format": "xlsx"}),
+        json!({"sql": "SELECT 1", "format": "sql-insert"}),
+        json!({"sql": "SELECT 1", "format": "csv", "table": {"name": "t"}}),
+        json!({"sql": "SELECT 1", "format": "jsonl", "formula_guard": false}),
+        json!({"sql": "SELECT 1", "format": "csv", "max_rows": 0}),
+        json!({"sql": "SELECT 1", "format": "csv", "path": "/tmp/x"}),
+    ] {
+        let (_, v, _) = call(&p, &exp, "erin", "write", &format!("v2/sessions/{sid}/export"), body.clone());
+        assert_eq!(code(&v), "bad_request", "{body}: {v}");
+    }
+    let (_, v, _) = call(
+        &p,
+        &exp,
+        "erin",
+        "write",
+        &format!("v2/sessions/{sid}/export"),
+        json!({"sql": "SELECT g FROM generate_series(1, 3) g", "format": "csv"}),
+    );
+    let job = v["data"]["job"].as_str().unwrap().to_string();
+    let (_, v, _) = call(&p, &exp, "erin", "read", &format!("v2/sessions/{sid}/exports/{job}/7"), json!({}));
+    assert_eq!(code(&v), "bad_request", "{v}");
+    let (_, v, _) = call(&p, &exp, "erin", "read", &format!("v2/sessions/{sid}/exports/{job}/x"), json!({}));
+    assert_eq!(code(&v), "bad_request");
+    // Another principal cannot pull it.
+    let (_, v, _) = call(&p, &ana, "ana", "read", &format!("v2/sessions/{sid}/exports/{job}/0"), json!({}));
+    assert_eq!(code(&v), "not_found");
+
+    // Drain it: a pull waits for data or the end, and the end frees the session.
+    let mut offset = 0;
+    loop {
+        let (_, v, _) = call(&p, &exp, "erin", "read", &format!("v2/sessions/{sid}/exports/{job}/{offset}"), json!({}));
+        offset = v["data"]["next_offset"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        if v["data"]["eof"] == true {
+            break;
+        }
+    }
+    // ── a running export makes the session busy; cancel ends it
+    let (_, v, _) = call(
+        &p,
+        &exp,
+        "erin",
+        "write",
+        &format!("v2/sessions/{sid}/export"),
+        json!({"sql": "SELECT g, repeat('y', 500) FROM generate_series(1, 2000000) g", "format": "csv"}),
+    );
+    assert_eq!(code(&v), "", "{v}");
+    let job = v["data"]["job"].as_str().unwrap().to_string();
+    std::thread::sleep(Duration::from_millis(300));
+    let (_, busy, _) =
+        call(&p, &exp, "erin", "write", &format!("v2/sessions/{sid}/execute"), json!({"sql": "SELECT 1"}));
+    assert_eq!(code(&busy), "session_busy");
+    let (_, v, _) = call(&p, &exp, "erin", "write", &format!("v2/sessions/{sid}/exports/{job}/cancel"), json!({}));
+    assert_eq!(v["data"]["state"], "cancelled", "{v}");
+    let ev = exp.audit_events().into_iter().rev().find(|e| e["event"] == "dbms.export").unwrap();
+    assert_eq!(ev["outcome"], "cancelled");
+    let (_, pages) = exec(&p, &exp, "erin", &sid, "SELECT 1");
+    assert_eq!(last(&pages)["state"], "done", "the session is usable after a cancel");
+
+    // ── abandoned: no pull for export_idle_secs → expired, buffer dropped
+    let mut cfg = loopback_config();
+    cfg["export_idle_secs"] = json!(1);
+    exp.set_config(cfg);
+    let p2 = Plugin::new();
+    let sid2 = open(&p2, &exp, "erin");
+    let (_, v, _) = call(
+        &p2,
+        &exp,
+        "erin",
+        "write",
+        &format!("v2/sessions/{sid2}/export"),
+        json!({"sql": "SELECT g, repeat('z', 500) FROM generate_series(1, 200000) g", "format": "csv"}),
+    );
+    let job = v["data"]["job"].as_str().unwrap().to_string();
+    let t0 = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let (_, v, _) = call(&p2, &exp, "erin", "read", &format!("v2/sessions/{sid2}/exports/{job}"), json!({}));
+        if v["data"]["state"] == "expired" {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "the abandoned export did not expire: {v}");
+    }
+    let (_, v, _) = call(&p2, &exp, "erin", "read", &format!("v2/sessions/{sid2}/exports/{job}/0"), json!({}));
+    assert_eq!(code(&v), "export_expired");
+    assert!(exp.audit_events().iter().any(|e| e["event"] == "dbms.export" && e["outcome"] == "expired"));
+
+    for h in [&ana, &exp] {
+        h.assert_no_leak(b"");
+    }
+}
+
+#[test]
+#[ignore = "needs docker; run with --run-ignored"]
+fn live_scripts() {
+    let Some(fx) = fixture() else { return };
+    let p = Plugin::new();
+    let rw = &["sql_select", "sql_insert", "sql_update", "sql_delete"];
+
+    // ── execute never runs two statements; a script needs sql_script
+    let carol = fx.host(rw, "disable");
+    let sid = open(&p, &carol, "carol");
+    let (v, _) = exec(&p, &carol, "carol", &sid, "INSERT INTO public.t (id, name) VALUES (40, 'x'); SELECT 1");
+    assert_eq!(code(&v), "use_script", "{v}");
+    let (v, _) =
+        script(&p, &carol, "carol", &sid, json!({"sql": "INSERT INTO public.t (id, name) VALUES (40, 'x'); SELECT 1"}));
+    assert_eq!(v["data"]["state"], "refused", "{v}");
+    assert_eq!(v["data"]["message"], "the script needs `sql_script` on the server");
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 40"), "0");
+
+    // ── all or nothing: one refused statement runs nothing, and is named
+    let scripter = fx.host(&["sql_select", "sql_insert", "sql_update", "sql_script"], "disable");
+    let sid = open(&p, &scripter, "sam");
+    let body =
+        json!({"sql": "INSERT INTO public.t (id, name) VALUES (41, 'a');\nDELETE FROM public.canary;\nSELECT 1"});
+    let (v, _) = script(&p, &scripter, "sam", &sid, body);
+    assert_eq!(v["data"]["state"], "refused", "{v}");
+    assert_eq!(v["data"]["refused_statement"], 1);
+    assert!(v["data"]["message"].as_str().unwrap().starts_with("statement 2 needs `sql_delete`"), "{v}");
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 41"), "0", "nothing ran");
+    assert_eq!(fx.canary(), "intact");
+    // A statement that is always refused is named too.
+    let (_, v, _) = call(
+        &p,
+        &scripter,
+        "sam",
+        "write",
+        &format!("v2/sessions/{sid}/script"),
+        json!({"sql": "SELECT 1; SELECT pg_read_file('/etc/passwd')"}),
+    );
+    assert_eq!(code(&v), "refused_statement");
+    assert!(v["error"].as_str().unwrap().contains("statement 2"), "{v}");
+
+    // ── a script runs every statement, with per-statement progress
+    let body = json!({"sql": "INSERT INTO public.t (id, name) VALUES (42, 'b');\nUPDATE public.t SET name = 'c' WHERE id = 42;\nSELECT g FROM generate_series(1, 3) g"});
+    let (v, pages) = script(&p, &scripter, "sam", &sid, body);
+    assert_eq!(v["data"]["state"], "running", "{v}");
+    let end = last(&pages);
+    assert_eq!(end["state"], "done", "{end}");
+    let msgs = end["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert_eq!((msgs[0]["rows_affected"].clone(), msgs[1]["rows_affected"].clone()), (json!(1), json!(1)));
+    assert_eq!(msgs[2]["rows_returned"], 3);
+    assert!(rows(&pages).is_empty(), "a script's result rows are counted, not returned");
+    assert_eq!(fx.pg.psql("app", "SELECT name FROM public.t WHERE id = 42"), "c");
+    let ev = scripter.audit_events().into_iter().rev().find(|e| e["event"] == "dbms.script").unwrap();
+    assert_eq!((ev["statements"].clone(), ev["outcomes"]["ok"].clone()), (json!(3), json!(3)));
+    assert!(ev["digest"].as_str().is_some_and(|d| d.len() == 64));
+
+    // ── transaction: single rolls everything back on an error
+    let body = json!({"sql": "INSERT INTO public.t (id, name) VALUES (43, 'd');\nINSERT INTO public.t (id, name) VALUES (43, 'dup')",
+        "transaction": "single"});
+    let (_, pages) = script(&p, &scripter, "sam", &sid, body);
+    let end = last(&pages);
+    assert_eq!(
+        (end["state"].clone(), end["script"]["tx_outcome"].clone()),
+        (json!("failed"), json!("rolled_back")),
+        "{end}"
+    );
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 43"), "0", "rolled back");
+    let body = json!({"sql": "INSERT INTO public.t (id, name) VALUES (44, 'e');\nUPDATE public.t SET name = 'f' WHERE id = 44",
+        "transaction": "single"});
+    let (_, pages) = script(&p, &scripter, "sam", &sid, body);
+    assert_eq!(last(&pages)["script"]["tx_outcome"], "committed");
+    assert_eq!(fx.pg.psql("app", "SELECT name FROM public.t WHERE id = 44"), "f");
+
+    // ── on_error: continue runs the rest and reports the failure
+    let body = json!({"sql": "INSERT INTO public.t (id, name) VALUES (45, 'g');\nINSERT INTO public.t (id, name) VALUES (45, 'dup');\nINSERT INTO public.t (id, name) VALUES (46, 'h')",
+        "on_error": "continue"});
+    let (_, pages) = script(&p, &scripter, "sam", &sid, body);
+    let end = last(&pages);
+    assert_eq!(end["state"], "failed");
+    let outcomes: Vec<&str> =
+        end["messages"].as_array().unwrap().iter().map(|m| m["outcome"].as_str().unwrap()).collect();
+    assert_eq!(outcomes, ["ok", "error", "ok"]);
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id IN (45, 46)"), "2");
+    // on_error: stop (the default) skips the rest.
+    let body = json!({"sql": "INSERT INTO public.t (id, name) VALUES (47, 'i');\nINSERT INTO public.t (id, name) VALUES (47, 'dup');\nINSERT INTO public.t (id, name) VALUES (48, 'j')"});
+    let (_, pages) = script(&p, &scripter, "sam", &sid, body);
+    assert_eq!(last(&pages)["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 48"), "0");
+    let ev = scripter.audit_events().into_iter().rev().find(|e| e["event"] == "dbms.script").unwrap();
+    assert_eq!(ev["skipped"], 1);
+
+    // ── option and limit refusals
+    for (body, want) in [
+        (json!({"sql": "SELECT 1", "transaction": "single", "on_error": "continue"}), "bad_request"),
+        (json!({"sql": "BEGIN; SELECT 1; COMMIT", "transaction": "single"}), "script_tx_control"),
+        (json!({"sql": "SELECT 1", "on_error": "maybe"}), "bad_request"),
+        (json!({"sql": "SELECT 1", "unknown": 1}), "bad_request"),
+    ] {
+        let (_, v, _) = call(&p, &scripter, "sam", "write", &format!("v2/sessions/{sid}/script"), body.clone());
+        assert_eq!(code(&v), want, "{body}: {v}");
+    }
+    let mut cfg = loopback_config();
+    cfg["script_statements"] = json!(2);
+    scripter.set_config(cfg);
+    let p2 = Plugin::new();
+    let sid2 = open(&p2, &scripter, "sam");
+    let (_, v, _) = call(
+        &p2,
+        &scripter,
+        "sam",
+        "write",
+        &format!("v2/sessions/{sid2}/script"),
+        json!({"sql": "SELECT 1; SELECT 2; SELECT 3"}),
+    );
+    assert_eq!(code(&v), "script_too_long", "{v}");
+    assert_eq!(fx.canary(), "intact");
+    scripter.assert_no_leak(b"");
+}
+
+#[test]
+#[ignore = "needs docker; run with --run-ignored"]
+fn live_step_up() {
+    let Some(fx) = fixture() else { return };
+    let p = Plugin::new();
+    let h = fx.host(&["sql_select", "sql_insert", "sql_update", "sql_delete", "sql_export", "sql_script"], "disable");
+    set_step_up(&h, &["sql_delete", "sql_export", "sql_script"]);
+    let sid = open(&p, &h, "sam");
+    let (_, st, _) = call(&p, &h, "sam", "read", &format!("v2/sessions/{sid}"), json!({}));
+    assert_eq!(st["data"]["step_up"], json!(["sql_delete", "sql_export", "sql_script"]));
+
+    // Uses no step-up capability: runs as before.
+    let (_, pages) = exec(&p, &h, "sam", &sid, "UPDATE public.t SET name = 'k' WHERE id = 1");
+    assert_eq!(last(&pages)["state"], "done");
+
+    // DELETE needs a ticket for exactly `sql_delete`; nothing runs without.
+    let sql = "DELETE FROM public.t WHERE id = 2";
+    let (v, _) = exec(&p, &h, "sam", &sid, sql);
+    assert_eq!(
+        (v["data"]["state"].clone(), v["data"]["action"].clone()),
+        (json!("step_up_required"), json!("sql_delete")),
+        "{v}"
+    );
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 2"), "1");
+    // Regression: a connect ticket (no action) is not accepted for an action.
+    h.tickets.lock().unwrap().push("connect-1".into());
+    let (_, v, _) = call(
+        &p,
+        &h,
+        "sam",
+        "write",
+        &format!("v2/sessions/{sid}/execute"),
+        json!({"sql": sql, "step_up_ticket": "connect-1"}),
+    );
+    assert_eq!(code(&v), "step_up_failed", "{v}");
+    // Nor a ticket bound to another action.
+    h.action_tickets.lock().unwrap().push(("sql_export".into(), "export-1".into()));
+    let (_, v, _) = call(
+        &p,
+        &h,
+        "sam",
+        "write",
+        &format!("v2/sessions/{sid}/execute"),
+        json!({"sql": sql, "step_up_ticket": "export-1"}),
+    );
+    assert_eq!(code(&v), "step_up_failed", "{v}");
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 2"), "1");
+    h.action_tickets.lock().unwrap().push(("sql_delete".into(), "delete-1".into()));
+    let (_, v, _) = call(
+        &p,
+        &h,
+        "sam",
+        "write",
+        &format!("v2/sessions/{sid}/execute"),
+        json!({"sql": sql, "step_up_ticket": "delete-1"}),
+    );
+    let run = v["data"]["run_id"].as_str().unwrap_or_else(|| panic!("{v}")).to_string();
+    assert_eq!(last(&poll(&p, &h, "sam", &sid, &run))["state"], "done");
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 2"), "0");
+    // The ticket was single use.
+    let (_, v, _) = call(
+        &p,
+        &h,
+        "sam",
+        "write",
+        &format!("v2/sessions/{sid}/execute"),
+        json!({"sql": "DELETE FROM public.t WHERE id = 1", "step_up_ticket": "delete-1"}),
+    );
+    assert_eq!(code(&v), "step_up_failed", "{v}");
+    let ev: Vec<Value> = h.audit_events().into_iter().filter(|e| e["event"] == "dbms.step_up").collect();
+    assert!(ev.iter().any(|e| e["outcome"] == "redeemed" && e["action"] == "sql_delete"), "{ev:?}");
+    assert!(ev.iter().any(|e| e["outcome"] == "refused"), "{ev:?}");
+
+    // A script with a DELETE needs one ticket for both actions.
+    let body = json!({"sql": "INSERT INTO public.t (id, name) VALUES (50, 'l'); DELETE FROM public.t WHERE id = 50"});
+    let (v, _) = script(&p, &h, "sam", &sid, body.clone());
+    assert_eq!(v["data"]["action"], "sql_delete,sql_script", "{v}");
+    h.action_tickets.lock().unwrap().push(("sql_delete,sql_script".into(), "both-1".into()));
+    let mut with = body.clone();
+    with["step_up_ticket"] = json!("both-1");
+    let (v, pages) = script(&p, &h, "sam", &sid, with);
+    assert_eq!(v["data"]["state"], "running", "{v}");
+    assert_eq!(last(&pages)["state"], "done");
+
+    // An export, and a grid delete.
+    let (v, _, _) = export(&p, &h, "sam", &sid, json!({"sql": "SELECT id FROM public.t", "format": "csv"}));
+    assert_eq!(v["data"]["action"], "sql_export", "{v}");
+    h.action_tickets.lock().unwrap().push(("sql_export".into(), "export-2".into()));
+    let (v, bytes, _) = export(
+        &p,
+        &h,
+        "sam",
+        &sid,
+        json!({"sql": "SELECT id FROM public.t", "format": "csv", "step_up_ticket": "export-2"}),
+    );
+    assert_eq!(v["data"]["state"], "running", "{v}");
+    assert!(String::from_utf8(bytes).unwrap().starts_with("\"id\"\r\n"));
+    let edit = json!({"object": {"schema": "public", "name": "t"}, "op": "delete", "key": {"id": 1}});
+    let (_, v, _) = call(&p, &h, "sam", "write", &format!("v2/sessions/{sid}/rows"), edit);
+    assert_eq!(v["data"]["state"], "step_up_required", "{v}");
+    assert_eq!(fx.pg.psql("app", "SELECT count(*) FROM public.t WHERE id = 1"), "1");
+    h.assert_no_leak(b"");
+}

@@ -3,7 +3,7 @@
 //! through the authorization step, idle / lifetime / idle-in-transaction
 //! limits, and closing (with rollback of an open transaction).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,14 +14,15 @@ use tokio::runtime::Runtime;
 
 use crate::api::{ApiError, Caller, Owner};
 use crate::audit::{self, Outbox, Pending};
-use crate::authz::{self, Resolutions};
+use crate::authz::{self, Mode, Resolutions};
 use crate::config::Config;
 use crate::driver::{ConnectSpec, DbError, PgConn, PluginSql, TextParam};
+use crate::export::{self, ExportJob, ExportLimits, ExportOptions, Format, InsertTarget};
 use crate::host::Host;
 use crate::ids;
 use crate::journal::{self, Record};
 use crate::profile::{self, Enforcement, Selection, Target, TlsMode};
-use crate::run::{self, Run, RunLimits, RunStatus, StatementResult};
+use crate::run::{self, Run, RunLimits, RunStatus, ScriptInfo, StatementResult};
 use crate::tls::RootSource;
 use crate::wire::TxStatus;
 
@@ -39,6 +40,9 @@ pub struct SessionInfo {
     /// The database itself enforces read-only transactions, and the server
     /// reports the setting so a change is seen (§5.3, Phase 2 obligation).
     pub database_read_only: bool,
+    /// The profile's `step_up` list at open (§8.3): a request that uses one
+    /// of these capabilities needs a fresh ticket bound to that action.
+    pub step_up: BTreeSet<&'static str>,
 }
 
 struct State {
@@ -59,6 +63,9 @@ struct State {
     journal: Record,
     /// An execute or a row edit is being set up on the connection.
     op: bool,
+    /// Export jobs (§8.1), running or waiting to be drained or reported.
+    exports: BTreeMap<String, Arc<ExportJob>>,
+    export_seq: u64,
 }
 
 pub struct Session {
@@ -116,6 +123,8 @@ impl Session {
                 "open_secs": st.tx_since.map(|t| t.elapsed().as_secs()),
             },
             "active_run": st.active.as_ref().filter(|r| r.status() == RunStatus::Running).map(|r| r.id.clone()),
+            "active_export": st.exports.values().find(|j| j.is_running()).map(|j| j.id.clone()),
+            "step_up": profile::canonical_action(&self.info.step_up).split(',').filter(|a| !a.is_empty()).collect::<Vec<_>>(),
             "idle_secs": st.last_used.elapsed().as_secs(),
             "age_secs": self.opened.elapsed().as_secs(),
             "rows_read": st.rows_read,
@@ -154,6 +163,12 @@ impl Session {
             return Err(ApiError::refused(
                 "session_busy",
                 "a run is in progress on this session; wait for it or cancel it",
+            ));
+        }
+        if st.exports.values().any(|j| j.is_running()) {
+            return Err(ApiError::refused(
+                "session_busy",
+                "an export is reading from this session's connection; finish or cancel it first",
             ));
         }
         st.op = true;
@@ -335,7 +350,7 @@ fn open_reserved(
     if p.require_mfa {
         let ticket =
             ticket.ok_or_else(|| ApiError::refused("mfa_required", "this SQL profile requires an MFA ticket"))?;
-        if !cx.host.ticket_redeem(&target.resource, &p.id, ticket)? {
+        if !cx.host.ticket_redeem(&target.resource, &p.id, ticket, None)? {
             return Err(ApiError::refused("mfa_required", "the MFA ticket was not redeemed for this profile"));
         }
     }
@@ -386,6 +401,7 @@ fn open_reserved(
         vault_only: selection.vault_only.clone(),
         tls_mode: p.tls.mode,
         database_read_only,
+        step_up: p.step_up.clone(),
     };
     let ns = if target.namespace.is_empty() { caller.namespace.clone() } else { target.namespace.clone() };
     let mut record = Record::new(owner, &id, &target.resource, &p.id, opened_ms, &ns);
@@ -415,6 +431,8 @@ fn open_reserved(
             run_seq: 0,
             journal: record,
             op: false,
+            exports: BTreeMap::new(),
+            export_seq: 0,
         }),
     });
     let mut ev = session.event("dbms.session.open");
@@ -425,6 +443,7 @@ fn open_reserved(
     ev["read_only"] = json!(session.info.read_only);
     ev["transport"] = json!("direct");
     ev["tls_mode"] = json!(session.info.tls_mode.as_str());
+    ev["step_up"] = json!(profile::canonical_action(&session.info.step_up));
     let _ = cx.host.audit(ev);
     let status = session.status();
     cx.reg.insert(session);
@@ -521,7 +540,7 @@ pub async fn resolve(conn: &PgConn, refs: &[ObjectRef]) -> Result<Resolutions, D
     Ok(out)
 }
 
-const EXECUTE_KEYS: [&str; 1] = ["sql"];
+const EXECUTE_KEYS: [&str; 2] = ["sql", "step_up_ticket"];
 
 /// `POST v2/sessions/<id>/execute {sql}` (§6.2): classify, resolve, ask the
 /// host, then start the run. Returns within the invoke deadline.
@@ -536,6 +555,7 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
     if text.len() > bv_sql_classify::MAX_TEXT_BYTES {
         return Err(ApiError::bad_request("`sql` is too large"));
     }
+    let ticket = text_field(data, "step_up_ticket", 256)?;
     s.touch();
     if let Some(why) = s.conn.wire().taint() {
         close(cx, s, "tainted");
@@ -578,26 +598,46 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
             .block_on(resolve(&s.conn, &refs))
             .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
     };
-    let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res)?;
+    let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Execute)?;
     let Some(stmts) = minted else {
-        for (meta, verdicts) in &decision.statements {
-            let mut ev = s.event("dbms.statement");
-            ev["outcome"] = json!("refused");
-            ev["index"] = json!(meta.index);
-            ev["kinds"] = json!([meta.kind_name()]);
-            ev["required"] = json!(meta.required_json());
-            ev["refused"] = json!(verdicts
-                .iter()
-                .filter(|v| !v.allowed)
-                .map(|v| json!({"capability": v.capability, "path": v.path}))
-                .collect::<Vec<_>>());
-            ev["unclassified"] = json!(meta.unclassified);
-            ev["digest"] = json!(digest);
-            let _ = cx.host.audit(ev);
-        }
+        audit_refused_statements(cx, s, &decision, &digest);
         return Ok(json!({"state": "refused", "message": decision.message(), "statements": decision.report()}));
     };
+    if let Some(mut reply) = step_up(cx, s, &decision.capabilities(), ticket)? {
+        reply["statements"] = json!(decision.report());
+        return Ok(reply);
+    }
+    start_execute(cx, s, text, lexer, decision, stmts, digest)
+}
 
+/// One `dbms.statement` refusal per statement of a refused batch.
+fn audit_refused_statements(cx: &Ctx<'_>, s: &Session, decision: &authz::Decision, digest: &str) {
+    for (meta, verdicts) in &decision.statements {
+        let mut ev = s.event("dbms.statement");
+        ev["outcome"] = json!(if verdicts.iter().all(|v| v.allowed) { "not_run" } else { "refused" });
+        ev["index"] = json!(meta.index);
+        ev["kinds"] = json!([meta.kind_name()]);
+        ev["required"] = json!(meta.required_json());
+        ev["refused"] = json!(verdicts
+            .iter()
+            .filter(|v| !v.allowed)
+            .map(|v| json!({"capability": v.capability, "path": v.path}))
+            .collect::<Vec<_>>());
+        ev["unclassified"] = json!(meta.unclassified);
+        ev["digest"] = json!(digest);
+        let _ = cx.host.audit(ev);
+    }
+}
+
+fn start_execute(
+    cx: &Ctx<'_>,
+    s: &Arc<Session>,
+    text: &str,
+    lexer: LexerSettings,
+    decision: authz::Decision,
+    stmts: Vec<authz::AuthorizedStatement>,
+    digest: String,
+) -> Result<Value, ApiError> {
     let journal_text = {
         let redacted = redact(Dialect::PostgreSql, lexer, text).ok();
         journal::text_for(&cx.cfg.journal_text, text, redacted)
@@ -610,13 +650,13 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
         if budget_left == Some(0) {
             return Err(ApiError::refused("row_budget", "the session's row budget is spent"));
         }
-        let limits = RunLimits {
-            deadline: Duration::from_secs(cx.cfg.run_timeout_secs),
-            page_rows: cx.cfg.page_rows as usize,
-            page_bytes: cx.cfg.page_bytes as usize,
-            grid_rows: cx.cfg.grid_rows,
+        let limits = RunLimits::execute(
+            Duration::from_secs(cx.cfg.run_timeout_secs),
+            cx.cfg.page_rows as usize,
+            cx.cfg.page_bytes as usize,
+            cx.cfg.grid_rows,
             budget_left,
-        };
+        );
         let run = Run::new(run_id.clone(), limits);
         for st_meta in stmts.iter().map(|a| a.meta()) {
             st.journal.push(json!({
@@ -639,6 +679,494 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
         drop(reg);
     });
     Ok(json!({"run_id": run.id, "state": "running", "statements": decision.report(), "digest": digest}))
+}
+
+/// Per-action step-up (§8.3), after the vault allowed the request: when it
+/// uses a capability the session's profile lists in `step_up`, it needs a
+/// ticket minted for exactly that action. `Ok(None)` lets it proceed;
+/// `Ok(Some(reply))` is the `step_up_required` answer (nothing ran, no
+/// ticket was spent); a ticket the host does not redeem refuses.
+pub fn step_up(
+    cx: &Ctx<'_>,
+    s: &Session,
+    caps: &BTreeSet<&'static str>,
+    ticket: Option<&str>,
+) -> Result<Option<Value>, ApiError> {
+    let needed: BTreeSet<&'static str> = caps.intersection(&s.info.step_up).copied().collect();
+    if needed.is_empty() {
+        return Ok(None);
+    }
+    let action = profile::canonical_action(&needed);
+    let Some(ticket) = ticket else {
+        return Ok(Some(json!({
+            "state": "step_up_required",
+            "action": action,
+            "actions": action.split(',').collect::<Vec<_>>(),
+            "message": format!(
+                "this profile requires a fresh MFA step-up for {action}: verify a factor for that action \
+                 (resources/v2/connect/mfa/verify with `action`) and resend with `step_up_ticket`"
+            ),
+        })));
+    };
+    let mut ev = s.event("dbms.step_up");
+    ev["action"] = json!(action);
+    let redeemed = cx.host.ticket_redeem(&s.resource, &s.profile, ticket, Some(&action));
+    let refused = match redeemed {
+        Ok(true) => None,
+        Ok(false) => Some(("not_redeemed".to_string(), "the host did not redeem the step-up ticket".to_string())),
+        Err(e) => Some((e.code.clone(), e.to_string())),
+    };
+    match refused {
+        None => {
+            ev["outcome"] = json!("redeemed");
+            let _ = cx.host.audit(ev);
+            Ok(None)
+        }
+        Some((code, message)) => {
+            ev["outcome"] = json!("refused");
+            ev["reason"] = json!(code);
+            let _ = cx.host.audit(ev);
+            Err(ApiError::refused("step_up_failed", message))
+        }
+    }
+}
+
+/// Whether the engine commits DDL implicitly, so a `transaction: single`
+/// script cannot be fully rolled back there (§8.2). PostgreSQL's DDL is
+/// transactional; MySQL, MariaDB and Oracle commit it implicitly.
+pub fn commits_ddl_implicitly(engine: &str) -> bool {
+    matches!(engine, "mysql" | "mariadb" | "oracle")
+}
+
+const SCRIPT_KEYS: [&str; 4] = ["sql", "on_error", "transaction", "step_up_ticket"];
+
+/// `POST v2/sessions/<id>/script {sql, on_error?, transaction?,
+/// step_up_ticket?}` (§8.2): split, classify and authorize every statement
+/// before the first runs, with `sql_script` on `sql/server`; one refusal
+/// runs nothing and names the statement. The run reports per-statement
+/// progress through `runs/<id>`.
+pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Value>) -> Result<Value, ApiError> {
+    if let Some(k) = data.keys().find(|k| !SCRIPT_KEYS.contains(&k.as_str())) {
+        return Err(ApiError::bad_request(format!("unknown field `{k}`")));
+    }
+    let text = match data.get("sql") {
+        Some(Value::String(t)) if !t.trim().is_empty() => t.as_str(),
+        _ => return Err(ApiError::bad_request("`sql` must be a non-empty string")),
+    };
+    let max_bytes = (cx.cfg.script_bytes as usize).min(bv_sql_classify::MAX_TEXT_BYTES);
+    if text.len() > max_bytes {
+        return Err(ApiError::refused("script_too_large", format!("a script may hold at most {max_bytes} bytes")));
+    }
+    let stop_on_error = match data.get("on_error") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(v)) if v == "stop" => true,
+        Some(Value::String(v)) if v == "continue" => false,
+        Some(_) => return Err(ApiError::bad_request("`on_error` is stop or continue")),
+    };
+    let single = match data.get("transaction") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(v)) if v == "none" => false,
+        Some(Value::String(v)) if v == "single" => true,
+        Some(_) => return Err(ApiError::bad_request("`transaction` is none or single")),
+    };
+    if single && !stop_on_error {
+        return Err(ApiError::bad_request(
+            "`on_error: continue` cannot run inside `transaction: single`: on PostgreSQL an error aborts the \
+             transaction, so nothing after it could run",
+        ));
+    }
+    let ticket = text_field(data, "step_up_ticket", 256)?;
+    s.touch();
+    if let Some(why) = s.conn.wire().taint() {
+        close(cx, s, "tainted");
+        return Err(ApiError::refused("session_tainted", format!("{why}; the session was closed")));
+    }
+    let _op = s.begin_op()?;
+    let (lexer, mut ctx, mut stale) = s.classify_inputs()?;
+    if stale {
+        if let Ok(fresh) = cx.rt.block_on(read_context(&s.conn, s.info.database_read_only)) {
+            let mut st = s.lock();
+            st.ctx = fresh.clone();
+            st.ctx_stale = false;
+            ctx = fresh;
+            stale = false;
+        }
+    }
+    let digest = ids::digest(cx.digest_key, "script", text.as_bytes());
+    let mut script_ev = s.event("dbms.script");
+    script_ev["digest"] = json!(digest);
+    script_ev["on_error"] = json!(if stop_on_error { "stop" } else { "continue" });
+    script_ev["transaction"] = json!(if single { "single" } else { "none" });
+    let refuse = |mut ev: Value, code: &str, statement: Option<usize>, count: Option<usize>| {
+        ev["outcome"] = json!("refused");
+        ev["reason"] = json!(code);
+        ev["statement"] = json!(statement);
+        ev["statements"] = json!(count);
+        let _ = cx.host.audit(ev);
+    };
+    let prepared = match authz::prepare(text, lexer, &ctx, false) {
+        Ok(p) => p,
+        Err(r) => {
+            refuse(script_ev, r.code, r.statement, None);
+            // The classifier's message names the statement (`statement 2 …`).
+            return Err(ApiError::refused(r.code, r.message));
+        }
+    };
+    let count = prepared.len();
+    if count as u64 > cx.cfg.script_statements {
+        refuse(script_ev, "script_too_long", None, Some(count));
+        return Err(ApiError::refused(
+            "script_too_long",
+            format!("a script may hold at most {} statements (this one has {count})", cx.cfg.script_statements),
+        ));
+    }
+    if stale && !prepared.only_tx_control() {
+        return Err(ApiError::refused(
+            "context_stale",
+            "the session's name context cannot be re-read (is the transaction aborted?); only ROLLBACK or COMMIT runs now",
+        ));
+    }
+    if single {
+        if prepared.tx_control_count() > 0 {
+            refuse(script_ev, "script_tx_control", None, Some(count));
+            return Err(ApiError::refused(
+                "script_tx_control",
+                "a `transaction: single` script may not hold BEGIN, COMMIT, ROLLBACK or SAVEPOINT; the plugin opens \
+                 and ends the transaction",
+            ));
+        }
+        if s.conn.wire().tx() != TxStatus::Idle {
+            refuse(script_ev, "transaction_open", None, Some(count));
+            return Err(ApiError::refused(
+                "transaction_open",
+                "a transaction is already open on this session; commit or roll it back, or use `transaction: none`",
+            ));
+        }
+    }
+    let refs = prepared.unresolved();
+    let res = if refs.is_empty() {
+        Resolutions::new()
+    } else {
+        cx.rt
+            .block_on(resolve(&s.conn, &refs))
+            .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
+    };
+    let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Script)?;
+    let Some(stmts) = minted else {
+        audit_refused_statements(cx, s, &decision, &digest);
+        let first = decision.statements.iter().find(|(_, v)| v.iter().any(|x| !x.allowed)).map(|(m, _)| m.index);
+        refuse(script_ev, "refused_statement", first, Some(count));
+        return Ok(json!({"state": "refused", "message": decision.message(), "statements": decision.report(),
+            "request": decision.request_report(), "refused_statement": first}));
+    };
+    if let Some(mut reply) = step_up(cx, s, &decision.capabilities(), ticket)? {
+        reply["statements"] = json!(decision.report());
+        reply["request"] = json!(decision.request_report());
+        return Ok(reply);
+    }
+    let engine = "postgresql";
+    let mut warnings = Vec::new();
+    if single && commits_ddl_implicitly(engine) {
+        warnings.push(format!(
+            "{engine} commits DDL implicitly: a failed script cannot be fully rolled back once a DDL statement ran"
+        ));
+    }
+    let info = ScriptInfo {
+        digest: digest.clone(),
+        statements: count,
+        on_error: if stop_on_error { "stop" } else { "continue" },
+        transaction: if single { "single" } else { "none" },
+    };
+    let run = {
+        let mut st = s.lock();
+        st.run_seq += 1;
+        let run_id = format!("r{}", st.run_seq);
+        let limits = RunLimits {
+            deadline: Duration::from_secs(cx.cfg.run_timeout_secs),
+            page_rows: cx.cfg.page_rows as usize,
+            page_bytes: cx.cfg.page_bytes as usize,
+            grid_rows: cx.cfg.grid_rows,
+            budget_left: None,
+            stop_on_error,
+            keep_rows: false,
+            per_statement_deadline: true,
+        };
+        let run = Run::with_script(run_id.clone(), limits, Some(info));
+        for a in &stmts {
+            let m = a.meta();
+            let redacted = redact(Dialect::PostgreSql, lexer, a.text()).ok();
+            st.journal.push(json!({
+                "run": run_id, "index": m.index, "at_ms": journal::now_ms(), "kinds": [m.kind_name()],
+                "required": m.required_json(), "unclassified": m.unclassified, "script": digest,
+                "text": journal::text_for(&cx.cfg.journal_text, a.text(), redacted), "outcome": "started",
+            }));
+        }
+        st.active = Some(run.clone());
+        st.runs.insert(run_id, run.clone());
+        run
+    };
+    s.flush_journal(cx.host);
+    let mut started = script_ev;
+    started["outcome"] = json!("started");
+    started["statements"] = json!(count);
+    started["run"] = json!(run.id);
+    let _ = cx.host.audit(started);
+    let (conn, session, run2) = (s.conn.clone(), s.clone(), run.clone());
+    cx.rt.spawn(async move {
+        let end = run_script(conn, run2, stmts, single).await;
+        after_run(&session, end).await;
+    });
+    Ok(json!({"run_id": run.id, "state": "running", "statements": decision.report(),
+        "request": decision.request_report(), "digest": digest, "warnings": warnings,
+        "on_error": if stop_on_error { "stop" } else { "continue" }, "transaction": if single { "single" } else { "none" }}))
+}
+
+/// A script run: with `transaction: single`, the plugin's own `BEGIN`
+/// before the first statement and `COMMIT` (every statement succeeded) or
+/// `ROLLBACK` (anything else) after the last, before the run reads as ended.
+async fn run_script(
+    conn: Arc<PgConn>,
+    run: Arc<Run>,
+    stmts: Vec<authz::AuthorizedStatement>,
+    single: bool,
+) -> run::RunEnd {
+    if !single {
+        return run::produce(conn, run, stmts).await;
+    }
+    let begin = PluginSql::guarded(sql!("BEGIN"));
+    if conn.internal_execute(&begin).await.is_err() {
+        run.set_tx_outcome("begin_failed");
+        run.finish_now(RunStatus::Failed);
+        return run::RunEnd { context_changed: false, rows_read: 0 };
+    }
+    let (end, status) = run::produce_unfinished(conn.clone(), run.clone(), stmts).await;
+    let (sql_end, outcome) = if status == RunStatus::Done {
+        (PluginSql::guarded(sql!("COMMIT")), "committed")
+    } else {
+        (PluginSql::guarded(sql!("ROLLBACK")), "rolled_back")
+    };
+    let ended = conn.internal_execute(&sql_end).await;
+    let status = match (&ended, status) {
+        (Ok(_), s) => {
+            run.set_tx_outcome(outcome);
+            s
+        }
+        (Err(_), RunStatus::Done) => {
+            run.set_tx_outcome("commit_failed");
+            RunStatus::Failed
+        }
+        (Err(_), s) => {
+            run.set_tx_outcome("rollback_failed");
+            s
+        }
+    };
+    run.finish_now(status);
+    end
+}
+
+const EXPORT_KEYS: [&str; 6] = ["sql", "format", "max_rows", "formula_guard", "table", "step_up_ticket"];
+
+/// `POST v2/sessions/<id>/export {sql, format, max_rows?, formula_guard?,
+/// table?, step_up_ticket?}` (§8.1): one statement that needs only
+/// `sql_select`, plus `sql_export` on every object it reads. The rows are
+/// pulled through `exports/<job>/<offset>`.
+pub fn export(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Value>) -> Result<Value, ApiError> {
+    if let Some(k) = data.keys().find(|k| !EXPORT_KEYS.contains(&k.as_str())) {
+        return Err(ApiError::bad_request(format!("unknown field `{k}`")));
+    }
+    let text = match data.get("sql") {
+        Some(Value::String(t)) if !t.trim().is_empty() => t.as_str(),
+        _ => return Err(ApiError::bad_request("`sql` must be a non-empty string")),
+    };
+    if text.len() > bv_sql_classify::MAX_TEXT_BYTES {
+        return Err(ApiError::bad_request("`sql` is too large"));
+    }
+    let format = Format::parse(data.get("format"))?;
+    let max_rows = match data.get("max_rows") {
+        None | Some(Value::Null) => cx.cfg.export_rows,
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=cx.cfg.export_rows).contains(&n) => n,
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "`max_rows` must be between 1 and {} (the configured limit)",
+                    cx.cfg.export_rows
+                )))
+            }
+        },
+    };
+    let formula_guard = match data.get("formula_guard") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(ApiError::bad_request("`formula_guard` must be a boolean")),
+    };
+    if !formula_guard && format != Format::Csv {
+        return Err(ApiError::bad_request("`formula_guard` applies to csv only"));
+    }
+    let target = match (format, data.get("table")) {
+        (Format::SqlInsert, Some(t)) if !t.is_null() => Some(InsertTarget::parse(t)?),
+        (Format::SqlInsert, _) => {
+            return Err(ApiError::bad_request("a sql-insert export needs `table` {schema?, name}"))
+        }
+        (_, None | Some(Value::Null)) => None,
+        (_, Some(_)) => return Err(ApiError::bad_request("`table` applies to sql-insert only")),
+    };
+    let ticket = text_field(data, "step_up_ticket", 256)?;
+    s.touch();
+    if let Some(why) = s.conn.wire().taint() {
+        close(cx, s, "tainted");
+        return Err(ApiError::refused("session_tainted", format!("{why}; the session was closed")));
+    }
+    let _op = s.begin_op()?;
+    if s.conn.wire().tx() == TxStatus::Failed {
+        return Err(ApiError::refused("transaction_aborted", "the open transaction failed; roll it back first"));
+    }
+    let (lexer, ctx, stale) = s.classify_inputs()?;
+    if stale {
+        return Err(ApiError::refused(
+            "context_stale",
+            "the session's name context cannot be re-read; run ROLLBACK or COMMIT first",
+        ));
+    }
+    let digest = ids::digest(cx.digest_key, "statement", text.as_bytes());
+    let mut ev = s.event("dbms.export");
+    ev["format"] = json!(format.as_str());
+    ev["digest"] = json!(digest);
+    let refused = |mut ev: Value, code: &str| {
+        ev["outcome"] = json!("refused");
+        ev["reason"] = json!(code);
+        let _ = cx.host.audit(ev);
+    };
+    let prepared = match authz::prepare(text, lexer, &ctx, true) {
+        Ok(p) => p,
+        Err(r) => {
+            refused(ev, r.code);
+            return Err(ApiError::refused(r.code, r.message));
+        }
+    };
+    if let Err(r) = prepared.check_export() {
+        refused(ev, r.code);
+        return Err(ApiError::refused(r.code, r.message));
+    }
+    let refs = prepared.unresolved();
+    let res = if refs.is_empty() {
+        Resolutions::new()
+    } else {
+        cx.rt
+            .block_on(resolve(&s.conn, &refs))
+            .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
+    };
+    let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Export)?;
+    let Some(mut stmts) = minted else {
+        audit_refused_statements(cx, s, &decision, &digest);
+        refused(ev, "refused_statement");
+        return Ok(json!({"state": "refused", "message": decision.message(), "statements": decision.report()}));
+    };
+    if let Some(mut reply) = step_up(cx, s, &decision.capabilities(), ticket)? {
+        reply["statements"] = json!(decision.report());
+        return Ok(reply);
+    }
+    let stmt = stmts.pop().ok_or_else(|| ApiError::internal("an authorized export has no statement"))?;
+    let max_bytes = cx.cfg.export_bytes;
+    let limits = ExportLimits { max_rows, max_bytes, deadline: Duration::from_secs(cx.cfg.export_timeout_secs) };
+    let job = {
+        let mut st = s.lock();
+        st.export_seq += 1;
+        let id = format!("e{}", st.export_seq);
+        let job = ExportJob::new(id, format, digest.clone(), limits);
+        let meta = stmt.meta();
+        let redacted = redact(Dialect::PostgreSql, lexer, text).ok();
+        st.journal.push(json!({
+            "export": job.id, "index": 0, "at_ms": journal::now_ms(), "kinds": [meta.kind_name()],
+            "required": meta.required_json(), "digest": digest, "format": format.as_str(),
+            "text": journal::text_for(&cx.cfg.journal_text, text, redacted), "outcome": "started",
+        }));
+        st.exports.insert(job.id.clone(), job.clone());
+        job
+    };
+    s.flush_journal(cx.host);
+    ev["outcome"] = json!("started");
+    ev["job"] = json!(job.id);
+    ev["max_rows"] = json!(max_rows);
+    ev["max_bytes"] = json!(max_bytes);
+    let _ = cx.host.audit(ev);
+    let opts = ExportOptions { format, formula_guard, target };
+    let restore = Duration::from_secs(cx.cfg.run_timeout_secs);
+    let (conn, job2) = (s.conn.clone(), job.clone());
+    cx.rt.spawn(async move {
+        export::produce(conn, job2, stmt, opts, restore).await;
+    });
+    Ok(json!({"job": job.id, "state": "running", "format": format.as_str(), "statements": decision.report(),
+        "digest": digest, "chunk_bytes": export::CHUNK_BYTES, "max_rows": max_rows, "max_bytes": max_bytes}))
+}
+
+fn export_job(s: &Session, job: &str) -> Result<Arc<ExportJob>, ApiError> {
+    s.lock().exports.get(job).cloned().ok_or_else(|| ApiError::not_found("no such export"))
+}
+
+/// The `dbms.export` outcome event, once the job has one (§11).
+fn report_export(host: Option<&dyn Host>, outbox: &Outbox, s: &Session, job: &ExportJob) {
+    let Some(fields) = job.take_report() else { return };
+    let mut ev = s.event("dbms.export");
+    for (k, v) in fields {
+        ev[k.as_str()] = v;
+    }
+    let outcome = ev["outcome"].clone();
+    s.lock().journal.complete_export(
+        &job.id,
+        json!({"outcome": outcome, "rows": ev["rows"], "bytes": ev["bytes"],
+        "sha256": ev["sha256"]}),
+    );
+    match host {
+        Some(h) => {
+            let _ = h.audit(ev);
+        }
+        None => outbox.push(&s.owner, Pending::Audit(ev)),
+    }
+}
+
+/// `GET v2/sessions/<id>/exports/<job>/<offset>`: the next 1 MiB chunk.
+/// Waits up to 2 s for data while the export runs, so a client does not
+/// spin on empty chunks.
+pub fn export_pull(cx: &Ctx<'_>, s: &Arc<Session>, job: &str, offset: &str) -> Result<Value, ApiError> {
+    s.touch();
+    if offset.is_empty() || offset.len() > 20 || !offset.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiError::bad_request("the offset is a byte count"));
+    }
+    let offset: u64 = offset.parse().map_err(|_| ApiError::bad_request("the offset is a byte count"))?;
+    let job = export_job(s, job)?;
+    cx.rt.block_on(job.wait_for_data(Duration::from_secs(2)));
+    let reply = job.pull(offset);
+    report_export(Some(cx.host), &cx.reg.outbox, s, &job);
+    reply
+}
+
+/// `GET v2/sessions/<id>/exports/<job>`.
+pub fn export_status(cx: &Ctx<'_>, s: &Arc<Session>, job: &str) -> Result<Value, ApiError> {
+    s.touch();
+    let job = export_job(s, job)?;
+    let view = job.status_view();
+    report_export(Some(cx.host), &cx.reg.outbox, s, &job);
+    Ok(view)
+}
+
+/// `POST v2/sessions/<id>/exports/<job>/cancel`.
+pub fn export_cancel(cx: &Ctx<'_>, s: &Arc<Session>, job: &str) -> Result<Value, ApiError> {
+    s.touch();
+    let job = export_job(s, job)?;
+    if job.is_running() {
+        job.request_cancel();
+        // The producer ends the statement; wait briefly so the reply says so.
+        let j = job.clone();
+        cx.rt.block_on(async move {
+            let t0 = tokio::time::Instant::now();
+            while j.is_running() && t0.elapsed() < Duration::from_secs(5) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+    }
+    let view = job.status_view();
+    report_export(Some(cx.host), &cx.reg.outbox, s, &job);
+    Ok(view)
 }
 
 /// Book-keeping once a run ends: rows read, transaction state, and the name
@@ -709,6 +1237,15 @@ fn report(cx_host: Option<&dyn Host>, outbox: &Outbox, s: &Session, run: &Run) -
         ev["rows_read"] = json!(st.rows_read);
         events.push(ev);
     }
+    if let Some(summary) = run.take_script_summary() {
+        let mut ev = s.event("dbms.script");
+        ev["run"] = json!(run.id);
+        ev["outcome"] = json!("ended");
+        for (k, v) in summary {
+            ev[k.as_str()] = v;
+        }
+        events.push(ev);
+    }
     drop(st);
     match cx_host {
         Some(h) => {
@@ -755,14 +1292,28 @@ pub fn close(cx: &Ctx<'_>, s: &Arc<Session>, reason: &str) {
 }
 
 pub async fn close_async(reg: &Registry, s: &Arc<Session>, reason: &str) {
-    let (active, runs) = {
+    let (active, runs, exports) = {
         let mut st = s.lock();
         if st.closed.is_some() {
             return;
         }
         st.closed = Some(reason.to_string());
-        (st.active.take(), std::mem::take(&mut st.runs))
+        (st.active.take(), std::mem::take(&mut st.runs), std::mem::take(&mut st.exports))
     };
+    for job in exports.values() {
+        if job.is_running() {
+            job.request_cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(3), s.conn.cancel()).await;
+            job.finish(export::JobStatus::Cancelled, None);
+        }
+        report_export(None, &reg.outbox, s, job);
+        if !job.reported() {
+            // Ended but not drained: what was left is dropped, and said so.
+            job.expire();
+            report_export(None, &reg.outbox, s, job);
+        }
+    }
+    drop(exports);
     if let Some(run) = &active {
         if run.status() == RunStatus::Running {
             run.request_cancel();
@@ -803,7 +1354,8 @@ pub async fn sweep(reg: &Registry, cfg: &Config) {
     for s in reg.all() {
         let (idle, busy, tx_idle) = {
             let st = s.lock();
-            let busy = st.active.as_ref().is_some_and(|r| r.status() == RunStatus::Running);
+            let busy = st.active.as_ref().is_some_and(|r| r.status() == RunStatus::Running)
+                || st.exports.values().any(|j| j.is_running());
             (st.last_used.elapsed(), busy, st.last_used.elapsed())
         };
         let reason = if s.conn.is_closed() {
@@ -847,6 +1399,39 @@ pub async fn sweep(reg: &Registry, cfg: &Config) {
         };
         for run in expired {
             report(None, &reg.outbox, &s, &run);
+        }
+        sweep_exports(reg, &s, cfg).await;
+    }
+}
+
+/// Exports nobody pulled for `export_idle_secs` are abandoned (§8.1): the
+/// statement is cancelled and the buffer dropped. Ended jobs are reported
+/// and, after the run retention, forgotten.
+async fn sweep_exports(reg: &Registry, s: &Arc<Session>, cfg: &Config) {
+    let jobs: Vec<Arc<ExportJob>> = s.lock().exports.values().cloned().collect();
+    let idle_limit = Duration::from_secs(cfg.export_idle_secs);
+    let retention = Duration::from_secs(cfg.run_retention_secs);
+    let mut forget = Vec::new();
+    for job in jobs {
+        // Failed or cancelled jobs report as they are; what is left unreported
+        // is running or not yet drained.
+        report_export(None, &reg.outbox, s, &job);
+        if !job.reported() && job.idle() >= idle_limit {
+            let was_running = job.is_running();
+            job.expire();
+            if was_running {
+                let _ = tokio::time::timeout(Duration::from_secs(3), s.conn.cancel()).await;
+            }
+            report_export(None, &reg.outbox, s, &job);
+        }
+        if job.reported() && job.finished_at().is_some_and(|f| f.elapsed() >= retention) {
+            forget.push(job.id.clone());
+        }
+    }
+    if !forget.is_empty() {
+        let mut st = s.lock();
+        for id in forget {
+            st.exports.remove(&id);
         }
     }
 }

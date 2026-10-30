@@ -197,6 +197,65 @@ impl Prepared {
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()
     }
+
+    /// Statements that are transaction control.
+    pub fn tx_control_count(&self) -> usize {
+        self.statements.iter().filter(|(_, c)| matches!(c, Classified::Ok(s) if s.tx_control)).count()
+    }
+
+    /// §8.1: an export is exactly one row-returning statement that needs
+    /// only `sql_select`. DML with `RETURNING`, a data-modifying CTE,
+    /// `FOR UPDATE`, a sequence write, an opaque call or an unclassifiable
+    /// statement needs more and is refused here, before the host is asked.
+    pub fn check_export(&self) -> Result<(), EarlyRefusal> {
+        let refuse = |code: &'static str, message: String| EarlyRefusal { code, message, statement: Some(0) };
+        let [(_, only)] = self.statements.as_slice() else {
+            return Err(EarlyRefusal {
+                code: "export_one_statement",
+                message: "an export runs exactly one statement, without transaction control".into(),
+                statement: None,
+            });
+        };
+        let c = match only {
+            Classified::Ok(c) => c,
+            Classified::Unknown(u) => {
+                return Err(refuse("export_not_select", format!("the statement cannot be classified ({})", u.reason)))
+            }
+        };
+        if c.tx_control || !EXPORT_KINDS.contains(&c.kind) || c.opaque {
+            return Err(refuse(
+                "export_not_select",
+                format!("only a SELECT, VALUES, SHOW or EXPLAIN can be exported (this is {:?})", c.kind),
+            ));
+        }
+        if let Some((cap, _)) = c.required.iter().find(|(cap, _)| cap.as_str() != "sql_select") {
+            return Err(refuse(
+                "export_not_select",
+                format!("an export may need only sql_select; this statement needs `{}`", cap.as_str()),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Statement kinds an export may run (§8.1): they return rows and read only.
+const EXPORT_KINDS: [StatementKind; 4] =
+    [StatementKind::Select, StatementKind::Values, StatementKind::Show, StatementKind::Explain];
+
+/// What the batch is for. It decides the extra checks and how unqualified
+/// names are resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// `execute`: one statement plus transaction control.
+    Execute,
+    /// `script` (§8.2): adds `sql_script` on `sql/server`; names after the
+    /// first statement that may change the name context are checked as
+    /// unaddressable, because the classification-time resolution no
+    /// longer describes what the server will resolve.
+    Script,
+    /// `export` (§8.1): every `sql_select` check gains `sql_export` on the
+    /// same target.
+    Export,
 }
 
 /// Names resolved through the catalog: `Some(schema)` when the reference
@@ -224,15 +283,36 @@ fn checks_for(c: &ClassifiedStatement, res: &Resolutions) -> Vec<Check> {
     set.into_iter().collect()
 }
 
-/// The host's decision for a batch, statement by statement.
+/// The host's decision for a batch, statement by statement, plus the
+/// checks of the request itself (`sql_script` on `sql/server`).
 #[derive(Debug, Clone)]
 pub struct Decision {
     pub statements: Vec<(StatementMeta, Vec<Verdict>)>,
+    pub request: Vec<Verdict>,
 }
 
 impl Decision {
     pub fn allowed(&self) -> bool {
-        self.statements.iter().all(|(_, v)| v.iter().all(|x| x.allowed))
+        self.request.iter().all(|x| x.allowed) && self.statements.iter().all(|(_, v)| v.iter().all(|x| x.allowed))
+    }
+
+    /// Every capability the batch uses (statements and request), for the
+    /// per-action step-up (§8.3).
+    pub fn capabilities(&self) -> BTreeSet<&'static str> {
+        let request = self.request.iter().filter_map(|v| crate::profile::cap_static(&v.capability));
+        let statements = self.statements.iter().flat_map(|(m, _)| m.checks.iter().map(|c| c.capability));
+        request.chain(statements).collect()
+    }
+
+    /// The request-level verdicts, for the reply.
+    pub fn request_report(&self) -> Vec<Value> {
+        self.request
+            .iter()
+            .map(|v| {
+                json!({"capability": v.capability, "target": v.target, "allowed": v.allowed,
+                "denied_by_deny": v.denied_by_deny})
+            })
+            .collect()
     }
 
     /// `{index, kinds, required, verdict}` per statement (§6.2).
@@ -255,6 +335,10 @@ impl Decision {
 
     /// "needs `sql_update` on `app.public.t`" for the first refusal.
     pub fn message(&self) -> String {
+        if let Some(v) = self.request.iter().find(|v| !v.allowed) {
+            let deny = if v.denied_by_deny { " (an explicit deny applies)" } else { "" };
+            return format!("the script needs `{}` on the server{deny}", v.capability);
+        }
         for (m, vs) in &self.statements {
             if let Some(v) = vs.iter().find(|v| !v.allowed) {
                 let target = match &v.target {
@@ -291,19 +375,38 @@ pub fn authorize(
     session_id: &str,
     prepared: Prepared,
     res: &Resolutions,
+    mode: Mode,
 ) -> Result<(Decision, Option<Vec<AuthorizedStatement>>), ApiError> {
+    if mode == Mode::Export {
+        prepared.check_export().map_err(|r| ApiError::refused(r.code, r.message))?;
+    }
+    let unresolved = Resolutions::new();
+    let mut context_changed = false;
     let mut metas = Vec::with_capacity(prepared.statements.len());
     for (i, (_, c)) in prepared.statements.iter().enumerate() {
+        // In a script, a statement after one that may move the search path
+        // is checked without the classification-time resolution (§4.4).
+        let res_here = if mode == Mode::Script && context_changed { &unresolved } else { res };
         let meta = match c {
-            Classified::Ok(s) => StatementMeta {
-                index: i,
-                kind: Some(s.kind),
-                tx_control: s.tx_control,
-                opaque: s.opaque,
-                unclassified: false,
-                unclassified_reason: None,
-                checks: checks_for(s, res),
-            },
+            Classified::Ok(s) => {
+                let mut checks = checks_for(s, res_here);
+                if mode == Mode::Export {
+                    let export: Vec<Check> =
+                        checks.iter().map(|c| Check { capability: "sql_export", target: c.target.clone() }).collect();
+                    checks.extend(export);
+                    checks.sort();
+                    checks.dedup();
+                }
+                StatementMeta {
+                    index: i,
+                    kind: Some(s.kind),
+                    tx_control: s.tx_control,
+                    opaque: s.opaque,
+                    unclassified: false,
+                    unclassified_reason: None,
+                    checks,
+                }
+            }
             Classified::Unknown(u) => StatementMeta {
                 index: i,
                 kind: None,
@@ -319,10 +422,17 @@ pub fn authorize(
         if meta.checks.is_empty() && !meta.tx_control {
             return Err(ApiError::refused("refused_statement", format!("statement {} has no requirement", i + 1)));
         }
+        context_changed |= meta.changes_context();
         metas.push(meta);
     }
-    let mut batch: Vec<Check> =
-        metas.iter().flat_map(|m| m.checks.iter().cloned()).collect::<BTreeSet<_>>().into_iter().collect();
+    let request_checks: Vec<Check> = if mode == Mode::Script { vec![Check::server("sql_script")] } else { Vec::new() };
+    let mut batch: Vec<Check> = metas
+        .iter()
+        .flat_map(|m| m.checks.iter().cloned())
+        .chain(request_checks.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     if batch.len() > MAX_CHECKS {
         return Err(ApiError::refused("too_many_checks", "the statement references too many objects"));
     }
@@ -338,7 +448,8 @@ pub fn authorize(
             (m, vs)
         })
         .collect();
-    let decision = Decision { statements };
+    let request = request_checks.iter().filter_map(|c| by_check.get(c).cloned()).collect();
+    let decision = Decision { statements, request };
     if !decision.allowed() {
         return Ok((decision, None));
     }
@@ -407,7 +518,7 @@ mod tests {
         res: &Resolutions,
     ) -> Result<(Decision, Option<Vec<AuthorizedStatement>>), ApiError> {
         let p = prepare(text, SCS, &ctx(), true).map_err(|e| ApiError::refused(e.code, e.message))?;
-        authorize(h, "db", "sess-1", p, res)
+        authorize(h, "db", "sess-1", p, res, Mode::Execute)
     }
 
     #[test]
@@ -456,7 +567,7 @@ mod tests {
         for r in p.unresolved() {
             res.insert(r, Some("sales".into()));
         }
-        authorize(&*h, "db", "s", p, &res).unwrap();
+        authorize(&*h, "db", "s", p, &res, Mode::Execute).unwrap();
         assert_eq!(h.authorized.lock().unwrap()[1], vec![Check::object("sql_select", "app", "sales", "t")]);
     }
 
@@ -473,6 +584,95 @@ mod tests {
             assert_eq!(prepare(text, SCS, &ctx(), true).unwrap_err().code, code, "{text}");
         }
         assert!(prepare("SELECT 1; SELECT 2", SCS, &ctx(), false).is_ok(), "a script may hold several");
+    }
+
+    /// §8.1: an export needs only `sql_select`, plus `sql_export` on every
+    /// object it reads (on the server when it reads none); everything else
+    /// is refused before the host is asked.
+    #[test]
+    fn exports_need_select_only_and_sql_export_on_what_they_read() {
+        let h = host();
+        let p = prepare("SELECT a FROM public.t JOIN public.u USING (id)", SCS, &ctx(), true).unwrap();
+        let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap();
+        assert_eq!(minted.unwrap().len(), 1);
+        let asked = h.authorized.lock().unwrap()[0].clone();
+        for o in ["t", "u"] {
+            assert!(asked.contains(&Check::object("sql_select", "app", "public", o)), "{asked:?}");
+            assert!(asked.contains(&Check::object("sql_export", "app", "public", o)), "{asked:?}");
+        }
+        assert_eq!(d.capabilities(), ["sql_export", "sql_select"].into_iter().collect());
+        let p = prepare("SELECT now()", SCS, &ctx(), true).unwrap();
+        authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap();
+        assert!(h.authorized.lock().unwrap()[1].contains(&Check::server("sql_export")));
+
+        h.allow(|c| c.capability == "sql_select");
+        let p = prepare("SELECT * FROM public.t", SCS, &ctx(), true).unwrap();
+        let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap();
+        assert!(minted.is_none(), "sql_select alone does not export");
+        assert_eq!(d.message(), "statement 1 needs `sql_export` on `app.public.t`");
+
+        h.allow(|_| true);
+        for text in [
+            "DELETE FROM public.t RETURNING *",
+            "UPDATE public.t SET a = 1 RETURNING a",
+            "INSERT INTO public.t VALUES (1) RETURNING *",
+            "WITH d AS (DELETE FROM public.t RETURNING *) SELECT * FROM d",
+            "SELECT * FROM public.t FOR UPDATE",
+            "SELECT nextval('public.s')",
+            "BEGIN; SELECT 1",
+            "SET search_path = x",
+            "TABLE t",
+        ] {
+            let asked_before = h.authorized.lock().unwrap().len();
+            let p = prepare(text, SCS, &ctx(), true).unwrap();
+            let e = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap_err();
+            assert!(e.code.starts_with("export_"), "{text}: {e}");
+            assert_eq!(h.authorized.lock().unwrap().len(), asked_before, "{text}: the host was asked");
+        }
+    }
+
+    /// §8.2: a script needs `sql_script` on the server on top of every
+    /// statement's own privileges, and one refusal mints nothing.
+    #[test]
+    fn scripts_need_sql_script_and_are_all_or_nothing() {
+        let h = host();
+        h.allow(|c| c.capability != "sql_script");
+        let p = prepare("SELECT 1; UPDATE public.t SET a = 1 WHERE b = 2", SCS, &ctx(), false).unwrap();
+        let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Script).unwrap();
+        assert!(minted.is_none());
+        assert_eq!(d.message(), "the script needs `sql_script` on the server");
+        assert!(h.authorized.lock().unwrap()[0].contains(&Check::server("sql_script")));
+        assert_eq!(d.request_report()[0]["allowed"], false);
+
+        h.allow(|c| c.capability != "sql_drop");
+        let p = prepare("SELECT 1; DROP TABLE public.t; SELECT 2", SCS, &ctx(), false).unwrap();
+        let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Script).unwrap();
+        assert!(minted.is_none(), "one refused statement refuses the script");
+        assert!(d.message().starts_with("statement 2 needs `sql_drop`"), "{}", d.message());
+        assert_eq!(d.report()[1]["verdict"], "refused");
+
+        h.allow(|_| true);
+        let p = prepare("SELECT 1; DROP TABLE public.t; SELECT 2", SCS, &ctx(), false).unwrap();
+        let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Script).unwrap();
+        assert_eq!(minted.unwrap().len(), 3);
+        assert!(d.capabilities().contains("sql_script") && d.capabilities().contains("sql_drop"));
+    }
+
+    /// A script's names after a statement that may move the search path are
+    /// checked as unaddressable: the earlier resolution no longer holds.
+    #[test]
+    fn script_names_after_a_context_change_are_unaddressable() {
+        let h = host();
+        let p = prepare("SELECT * FROM t; SET search_path = other; DROP TABLE t", SCS, &ctx(), false).unwrap();
+        let mut res = Resolutions::new();
+        for r in p.unresolved() {
+            res.insert(r, Some("public".into()));
+        }
+        authorize(&*h, "db", "s", p, &res, Mode::Script).unwrap();
+        let asked = h.authorized.lock().unwrap()[0].clone();
+        assert!(asked.contains(&Check::object("sql_select", "app", "public", "t")), "{asked:?}");
+        assert!(asked.contains(&Check::object("sql_drop", "app", "", "t")), "{asked:?}");
+        assert!(!asked.contains(&Check::object("sql_drop", "app", "public", "t")), "{asked:?}");
     }
 
     #[test]
@@ -511,7 +711,7 @@ mod tests {
         fn sql_credential(&self, _: &str, _: &str, _: &str) -> Result<crate::host::Credential, crate::host::HostError> {
             unreachable!()
         }
-        fn ticket_redeem(&self, _: &str, _: &str, _: &str) -> Result<bool, crate::host::HostError> {
+        fn ticket_redeem(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<bool, crate::host::HostError> {
             unreachable!()
         }
         fn audit(&self, _: Value) -> Result<(), crate::host::HostError> {
@@ -535,7 +735,7 @@ mod tests {
     #[test]
     fn a_reply_that_does_not_match_the_checks_refuses_everything() {
         let p = prepare("UPDATE public.t SET a = 1 WHERE b = 2", SCS, &ctx(), true).unwrap();
-        let e = authorize(&Liar, "db", "s", p, &Resolutions::new()).unwrap_err();
+        let e = authorize(&Liar, "db", "s", p, &Resolutions::new(), Mode::Execute).unwrap_err();
         assert_eq!(e.code, "internal");
         let edit = authorize_edit(
             &Liar,

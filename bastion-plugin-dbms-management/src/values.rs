@@ -36,6 +36,24 @@ pub fn kind(ty: &Type) -> &'static str {
     }
 }
 
+/// A database number (integer, float or `numeric`), through domains. Its
+/// cells are numbers or decimal strings the server produced, never text a
+/// user typed: exports write them as is (§8.1 formula guard).
+pub fn is_numeric(ty: &Type) -> bool {
+    if let Kind::Domain(base) = ty.kind() {
+        return is_numeric(base);
+    }
+    matches!(*ty, Type::INT2 | Type::INT4 | Type::INT8 | Type::OID | Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC)
+}
+
+/// `bytea`, through domains: its cells are base64.
+pub fn is_bytea(ty: &Type) -> bool {
+    match ty.kind() {
+        Kind::Domain(base) => is_bytea(base),
+        _ => *ty == Type::BYTEA,
+    }
+}
+
 /// Types whose binary form is their text (`citext` and other extension
 /// text types are recognised by name).
 fn is_texty(ty: &Type) -> bool {

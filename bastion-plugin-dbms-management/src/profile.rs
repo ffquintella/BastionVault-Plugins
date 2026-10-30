@@ -41,6 +41,12 @@ pub fn cap_static(name: &str) -> Option<&'static str> {
     ALL_CAPS.iter().copied().find(|c| *c == name)
 }
 
+/// A step-up action as the host binds it (§8.3): the capabilities in
+/// policy-language order, comma-separated (`sql_drop,sql_script`).
+pub fn canonical_action(caps: &BTreeSet<&'static str>) -> String {
+    ALL_CAPS.iter().copied().filter(|c| caps.contains(c)).collect::<Vec<_>>().join(",")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
     VerifyFull,
@@ -104,6 +110,9 @@ pub struct Profile {
     pub tls: Tls,
     pub ceiling: BTreeSet<&'static str>,
     pub require_mfa: bool,
+    /// Capabilities whose use needs a fresh step-up ticket bound to that
+    /// action (§8.3), as the profile stated them when the session opened.
+    pub step_up: BTreeSet<&'static str>,
     pub source: CredentialSource,
 }
 
@@ -180,6 +189,9 @@ impl Profile {
             _ => return Err("bad `credential_source`".into()),
         };
         let port = v.get("port").and_then(Value::as_u64).filter(|p| (1..=65535).contains(p)).ok_or("bad `port`")?;
+        // The host's view always lists `step_up` (T124); a missing or
+        // malformed list fails the profile rather than reading as "none".
+        let step_up = caps(v.get("step_up")).map_err(|_| "bad `step_up`".to_string())?;
         Ok(Self {
             id: req("id")?,
             label: text(v, "label").unwrap_or_default(),
@@ -190,6 +202,7 @@ impl Profile {
             tls: Tls { mode, server_name: opt(tls, "server_name")?, ca_pem: opt(tls, "ca_pem")? },
             ceiling,
             require_mfa: v.get("require_mfa").and_then(Value::as_bool).ok_or("bad `require_mfa`")?,
+            step_up,
             source,
         })
     }
@@ -393,6 +406,23 @@ pub(crate) mod tests {
         assert_eq!(t.profiles.len(), 1, "only the dynamic profile parses");
         assert_eq!(t.invalid.len(), 2);
         assert_eq!(select(&t, None).unwrap_err().code, "no_profile_for_grant");
+    }
+
+    #[test]
+    fn step_up_lists_parse_strictly() {
+        let mut p = profile_json("ro", &["sql_select"]);
+        p["step_up"] = json!(["sql_script", "sql_drop"]);
+        let parsed = Profile::parse(&p).unwrap();
+        assert_eq!(canonical_action(&parsed.step_up), "sql_drop,sql_script");
+        for bad in [json!(null), json!("sql_drop"), json!(["sql_nope"]), json!([1])] {
+            let mut q = profile_json("ro", &["sql_select"]);
+            q["step_up"] = bad.clone();
+            assert!(Profile::parse(&q).is_err(), "{bad}");
+        }
+        let mut q = profile_json("ro", &["sql_select"]);
+        q.as_object_mut().unwrap().remove("step_up");
+        assert!(Profile::parse(&q).is_err(), "a missing step_up is not \"none\"");
+        assert_eq!(canonical_action(&BTreeSet::new()), "");
     }
 
     #[test]

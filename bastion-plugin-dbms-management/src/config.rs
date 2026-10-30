@@ -4,6 +4,10 @@
 //! Parsing is strict: an unknown key, a wrong type or a value above its hard
 //! maximum refuses the write. A stored record that does not parse is not
 //! trusted; the defaults apply and the error is reported on read.
+//!
+//! Versions: `v: 1` (T125) had no script or export limits. It is still read
+//! (read-old): the new limits take their defaults and the record becomes
+//! `v: 2` in memory, which is what the next write stores (write-new).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,7 +16,9 @@ use crate::api::ApiError;
 use crate::netpolicy::Cidr;
 
 pub const CONFIG_KEY: &str = "dbms/config";
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
+/// The T125 record, read and migrated (no script or export limits).
+pub const CONFIG_VERSION_V1: u32 = 1;
 
 /// The host's bounded line reader caps one stdio line at 4 MiB, and a reply
 /// travels base64-encoded inside it, so a page's JSON must stay under 3 MiB.
@@ -48,6 +54,25 @@ pub struct Config {
     pub connect_timeout_secs: u64,
     pub journal_text: JournalText,
     pub journal_retention_days: u64,
+    /// Most statements in one script (§8.2, §12). v2.
+    #[serde(default = "d_script_statements")]
+    pub script_statements: u64,
+    /// Largest script text in bytes. The hard maximum is the classifier's
+    /// input cap (4 MiB), below §12's 32 MiB. v2.
+    #[serde(default = "d_script_bytes")]
+    pub script_bytes: u64,
+    /// Most rows one export writes (§8.1). v2.
+    #[serde(default = "d_export_rows")]
+    pub export_rows: u64,
+    /// Most bytes one export writes. v2.
+    #[serde(default = "d_export_bytes")]
+    pub export_bytes: u64,
+    /// An export nobody pulled from for this long is cancelled. v2.
+    #[serde(default = "d_export_idle_secs")]
+    pub export_idle_secs: u64,
+    /// The database statement timeout while an export streams. v2.
+    #[serde(default = "d_export_timeout_secs")]
+    pub export_timeout_secs: u64,
     /// CIDRs the plugin may dial (checked after DNS, §12).
     pub allowed_networks: Vec<String>,
     /// CIDRs never dialled, whatever `allowed_networks` says: loopback,
@@ -71,11 +96,39 @@ const LIMITS: &[(&str, u64, u64)] = &[
     ("run_retention_secs", 600, 3_600),
     ("connect_timeout_secs", 10, 60),
     ("journal_retention_days", 90, 3_650),
+    ("script_statements", 1_000, bv_sql_classify::MAX_STATEMENTS as u64),
+    ("script_bytes", bv_sql_classify::MAX_TEXT_BYTES as u64, bv_sql_classify::MAX_TEXT_BYTES as u64),
+    ("export_rows", 1_000_000, 10_000_000),
+    ("export_bytes", 512 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
+    ("export_idle_secs", 300, 3_600),
+    ("export_timeout_secs", 1_800, 3_600),
 ];
+
+fn limit_default(k: &str) -> u64 {
+    LIMITS.iter().find(|(n, _, _)| *n == k).map(|(_, d, _)| *d).unwrap_or(0)
+}
+fn d_script_statements() -> u64 {
+    limit_default("script_statements")
+}
+fn d_script_bytes() -> u64 {
+    limit_default("script_bytes")
+}
+fn d_export_rows() -> u64 {
+    limit_default("export_rows")
+}
+fn d_export_bytes() -> u64 {
+    limit_default("export_bytes")
+}
+fn d_export_idle_secs() -> u64 {
+    limit_default("export_idle_secs")
+}
+fn d_export_timeout_secs() -> u64 {
+    limit_default("export_timeout_secs")
+}
 
 impl Default for Config {
     fn default() -> Self {
-        let d = |k: &str| LIMITS.iter().find(|(n, _, _)| *n == k).map(|(_, d, _)| *d).unwrap_or(0);
+        let d = limit_default;
         Self {
             v: CONFIG_VERSION,
             run_timeout_secs: d("run_timeout_secs"),
@@ -93,6 +146,12 @@ impl Default for Config {
             connect_timeout_secs: d("connect_timeout_secs"),
             journal_text: JournalText::Redacted,
             journal_retention_days: d("journal_retention_days"),
+            script_statements: d("script_statements"),
+            script_bytes: d("script_bytes"),
+            export_rows: d("export_rows"),
+            export_bytes: d("export_bytes"),
+            export_idle_secs: d("export_idle_secs"),
+            export_timeout_secs: d("export_timeout_secs"),
             allowed_networks: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"].map(String::from).to_vec(),
             denied_networks: [
                 "127.0.0.0/8",
@@ -114,8 +173,13 @@ impl Default for Config {
 impl Config {
     /// Parse a stored or submitted record strictly and check every bound.
     pub fn parse(v: &Value) -> Result<Self, ApiError> {
-        let c: Config =
+        let mut c: Config =
             serde_json::from_value(v.clone()).map_err(|e| ApiError::bad_request(format!("invalid config: {e}")))?;
+        // Read-old: a v1 record has no script or export limits; serde gave
+        // them their defaults, and it is a v2 record from here on.
+        if c.v == CONFIG_VERSION_V1 {
+            c.v = CONFIG_VERSION;
+        }
         c.validate()?;
         Ok(c)
     }
@@ -205,7 +269,39 @@ mod tests {
         assert!(patch(json!({"journal_text": "verbatim"})).is_err());
         assert!(patch(json!({"page_bytes": PAGE_BYTES_HARD_MAX + 1})).is_err());
         let mut stored = serde_json::to_value(&c).unwrap();
-        stored["v"] = json!(2);
+        stored["v"] = json!(3);
         assert!(Config::parse(&stored).is_err(), "another record version is not trusted");
+        assert!(patch(json!({"script_statements": 10_001})).is_err());
+        assert!(patch(json!({"script_bytes": bv_sql_classify::MAX_TEXT_BYTES + 1})).is_err());
+        assert!(patch(json!({"export_bytes": 4u64 * 1024 * 1024 * 1024 + 1})).is_err());
+        assert_eq!(patch(json!({"export_rows": 10})).unwrap().export_rows, 10);
+    }
+
+    /// Read-old/write-new: the record T125 wrote (v1, without the script
+    /// and export limits) keeps every value it set, gains the defaults, and
+    /// is written back as v2.
+    #[test]
+    fn a_v1_record_is_read_and_written_as_v2() {
+        let v1 = json!({
+            "v": 1, "run_timeout_secs": 120, "page_rows": 100, "page_bytes": 2_000_000, "grid_rows": 10_000,
+            "row_budget": 50_000, "idle_secs": 900, "idle_tx_secs": 300, "lifetime_secs": 28_800,
+            "sessions_per_user": 5, "sessions_per_resource": 20, "sessions_per_node": 200,
+            "run_retention_secs": 600, "connect_timeout_secs": 10, "journal_text": "full",
+            "journal_retention_days": 30, "allowed_networks": ["10.0.0.0/8"], "denied_networks": ["127.0.0.0/8"]
+        });
+        let c = Config::parse(&v1).unwrap();
+        assert_eq!(c.v, CONFIG_VERSION);
+        assert_eq!((c.run_timeout_secs, c.page_rows, c.row_budget), (120, 100, Some(50_000)));
+        assert_eq!(c.journal_text, JournalText::Full);
+        assert_eq!((c.script_statements, c.export_rows, c.export_idle_secs), (1_000, 1_000_000, 300));
+        assert_eq!(c.export_bytes, 512 * 1024 * 1024);
+        let written = serde_json::to_value(&c).unwrap();
+        assert_eq!(written["v"], 2);
+        assert_eq!(written["script_bytes"], json!(bv_sql_classify::MAX_TEXT_BYTES));
+        assert_eq!(Config::parse(&written).unwrap(), c);
+        // A v1 record that names a key no version knows is still refused.
+        let mut bad = v1.clone();
+        bad["export_everything"] = json!(true);
+        assert!(Config::parse(&bad).is_err());
     }
 }

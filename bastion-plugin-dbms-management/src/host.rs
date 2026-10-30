@@ -135,8 +135,17 @@ pub trait Host {
     /// `resource_sql_credential`: the profile's login, released under the
     /// endpoint binding and audited by the host.
     fn sql_credential(&self, resource: &str, profile: &str, session_ref: &str) -> Result<Credential, HostError>;
-    /// `connect_ticket_redeem`: `Ok(true)` when a ticket was burnt.
-    fn ticket_redeem(&self, resource: &str, profile: &str, ticket: &str) -> Result<bool, HostError>;
+    /// `connect_ticket_redeem`: `Ok(true)` when a ticket was burnt. With
+    /// `action` (§8.3, a canonical comma-separated `sql_*` set) the host
+    /// demands a step-up ticket minted for exactly that action; without it,
+    /// a connect ticket.
+    fn ticket_redeem(
+        &self,
+        resource: &str,
+        profile: &str,
+        ticket: &str,
+        action: Option<&str>,
+    ) -> Result<bool, HostError>;
     /// `audit_emit`: the host stamps the invocation's caller as the actor.
     fn audit(&self, payload: Value) -> Result<(), HostError>;
     /// `storage_get`: `Ok(None)` when the key is absent.
@@ -180,8 +189,17 @@ impl Host for ProcessHostAdapter<'_> {
         Ok(Credential { secret_id, endpoint, username, password })
     }
 
-    fn ticket_redeem(&self, resource: &str, profile: &str, ticket: &str) -> Result<bool, HostError> {
-        Ok(self.inv.host().connect_ticket_redeem(resource, profile, ticket)?)
+    fn ticket_redeem(
+        &self,
+        resource: &str,
+        profile: &str,
+        ticket: &str,
+        action: Option<&str>,
+    ) -> Result<bool, HostError> {
+        Ok(match action {
+            None => self.inv.host().connect_ticket_redeem(resource, profile, ticket)?,
+            Some(a) => self.inv.host().connect_ticket_redeem_action(resource, profile, ticket, a)?,
+        })
     }
 
     fn audit(&self, payload: Value) -> Result<(), HostError> {

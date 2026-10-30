@@ -23,6 +23,8 @@ pub struct MockHost {
     /// `(endpoint, username)` released with [`PASSWORD`], or an error.
     pub credential: Mutex<Result<(String, String), HostError>>,
     pub tickets: Mutex<Vec<String>>,
+    /// Step-up tickets: `(canonical action, ticket)`, each redeemable once.
+    pub action_tickets: Mutex<Vec<(String, String)>>,
     pub audit: Mutex<Vec<Value>>,
     pub storage: Mutex<BTreeMap<String, Vec<u8>>>,
     pub logs: Mutex<Vec<String>>,
@@ -39,6 +41,7 @@ impl MockHost {
             decide: Mutex::new(Box::new(|_| true)),
             credential: Mutex::new(Ok(("10.0.0.5:5432".into(), "svc".into()))),
             tickets: Mutex::new(Vec::new()),
+            action_tickets: Mutex::new(Vec::new()),
             audit: Mutex::new(Vec::new()),
             storage: Mutex::new(BTreeMap::new()),
             logs: Mutex::new(Vec::new()),
@@ -127,8 +130,28 @@ impl Host for MockHost {
         Ok(Credential { secret_id: "s".into(), endpoint, username, password: Zeroizing::new(PASSWORD.into()) })
     }
 
-    fn ticket_redeem(&self, _resource: &str, _profile: &str, ticket: &str) -> Result<bool, HostError> {
+    fn ticket_redeem(
+        &self,
+        _resource: &str,
+        _profile: &str,
+        ticket: &str,
+        action: Option<&str>,
+    ) -> Result<bool, HostError> {
         self.calls.lock().unwrap().push("connect_ticket_redeem".into());
+        if let Some(action) = action {
+            // As on the host: only a ticket minted for exactly this action.
+            let mut t = self.action_tickets.lock().unwrap();
+            return match t.iter().position(|(a, x)| a == action && x == ticket) {
+                Some(i) => {
+                    t.remove(i);
+                    Ok(true)
+                }
+                None => Err(HostError::new(
+                    "refused",
+                    "mfa_required: the step-up ticket is unknown, used or bound elsewhere",
+                )),
+            };
+        }
         let mut t = self.tickets.lock().unwrap();
         match t.iter().position(|x| x == ticket) {
             Some(i) => {

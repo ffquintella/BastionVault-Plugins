@@ -105,6 +105,20 @@ impl Record {
         self.dirty = true;
     }
 
+    /// Record an export's outcome on its journal entry (§8.1).
+    pub fn complete_export(&mut self, job: &str, outcome: Value) {
+        if let Some(a) = self.body["statements"].as_array_mut() {
+            if let Some(e) = a.iter_mut().rev().find(|e| e["export"] == job) {
+                if let (Some(dst), Some(src)) = (e.as_object_mut(), outcome.as_object()) {
+                    for (k, v) in src {
+                        dst.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
     pub fn close(&mut self, reason: &str) {
         self.body["closed_at_ms"] = json!(now_ms());
         self.body["close_reason"] = json!(reason);

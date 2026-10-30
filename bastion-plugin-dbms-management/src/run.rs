@@ -77,6 +77,46 @@ pub struct RunLimits {
     pub grid_rows: u64,
     /// Rows the session may still read through the grid; `None` = no budget.
     pub budget_left: Option<u64>,
+    /// Stop at the first failed statement (`execute`, a script's
+    /// `on_error: stop`); otherwise run the rest (`on_error: continue`).
+    pub stop_on_error: bool,
+    /// Buffer result rows for the grid (`execute`). A script reports each
+    /// statement's outcome and counts its rows without returning them.
+    pub keep_rows: bool,
+    /// `deadline` applies to each statement (a script) rather than to the
+    /// whole run (`execute`).
+    pub per_statement_deadline: bool,
+}
+
+impl RunLimits {
+    /// The `execute` shape: stop on error, rows to the grid, one deadline.
+    pub fn execute(
+        deadline: Duration,
+        page_rows: usize,
+        page_bytes: usize,
+        grid_rows: u64,
+        budget_left: Option<u64>,
+    ) -> Self {
+        Self {
+            deadline,
+            page_rows,
+            page_bytes,
+            grid_rows,
+            budget_left,
+            stop_on_error: true,
+            keep_rows: true,
+            per_statement_deadline: false,
+        }
+    }
+}
+
+/// What a script run reports when it ends (`dbms.script`, §8.2).
+#[derive(Debug, Clone)]
+pub struct ScriptInfo {
+    pub digest: String,
+    pub statements: usize,
+    pub on_error: &'static str,
+    pub transaction: &'static str,
 }
 
 struct Buffered {
@@ -97,6 +137,10 @@ struct State {
     unreported: usize,
     finished: Option<Instant>,
     budget_exhausted: bool,
+    /// `transaction: single`: how the wrapping transaction ended.
+    tx_outcome: Option<&'static str>,
+    /// The script summary went to the audit stream.
+    script_reported: bool,
 }
 
 impl Drop for State {
@@ -120,6 +164,8 @@ fn scrub(v: &mut Value) {
 pub struct Run {
     pub id: String,
     pub started: Instant,
+    /// Present on a script run.
+    pub script: Option<ScriptInfo>,
     limits: RunLimits,
     state: Mutex<State>,
     space: Notify,
@@ -129,9 +175,14 @@ pub struct Run {
 
 impl Run {
     pub fn new(id: String, limits: RunLimits) -> Arc<Self> {
+        Self::with_script(id, limits, None)
+    }
+
+    pub fn with_script(id: String, limits: RunLimits, script: Option<ScriptInfo>) -> Arc<Self> {
         Arc::new(Self {
             id,
             started: Instant::now(),
+            script,
             limits,
             state: Mutex::new(State {
                 status: RunStatus::Running,
@@ -144,6 +195,8 @@ impl Run {
                 unreported: 0,
                 finished: None,
                 budget_exhausted: false,
+                tx_outcome: None,
+                script_reported: false,
             }),
             space: Notify::new(),
             cancel: Notify::new(),
@@ -190,6 +243,37 @@ impl Run {
         self.lock().budget_exhausted
     }
 
+    pub fn set_tx_outcome(&self, outcome: &'static str) {
+        self.lock().tx_outcome = Some(outcome);
+    }
+
+    /// The `dbms.script` summary, once, when a script run has ended and
+    /// every statement result was handed out: counts per outcome, and the
+    /// statements that never ran.
+    pub fn take_script_summary(&self) -> Option<serde_json::Map<String, Value>> {
+        let script = self.script.as_ref()?;
+        let mut st = self.lock();
+        if st.script_reported || st.status == RunStatus::Running || st.unreported < st.results.len() {
+            return None;
+        }
+        st.script_reported = true;
+        let mut outcomes = std::collections::BTreeMap::<&str, u64>::new();
+        for r in &st.results {
+            *outcomes.entry(r.outcome).or_default() += 1;
+        }
+        let skipped = script.statements.saturating_sub(st.results.len());
+        let mut m = serde_json::Map::new();
+        m.insert("statements".into(), json!(script.statements));
+        m.insert("digest".into(), json!(script.digest));
+        m.insert("outcomes".into(), json!(outcomes));
+        m.insert("skipped".into(), json!(skipped));
+        m.insert("on_error".into(), json!(script.on_error));
+        m.insert("transaction".into(), json!(script.transaction));
+        m.insert("tx_outcome".into(), json!(st.tx_outcome));
+        m.insert("state".into(), json!(st.status.as_str()));
+        Some(m)
+    }
+
     /// The next page and the run's state; frees buffer space.
     pub fn page(&self) -> Value {
         let mut st = self.lock();
@@ -223,6 +307,11 @@ impl Run {
             "messages": st.results.iter().map(StatementResult::message).collect::<Vec<_>>(),
             "elapsed_ms": self.started.elapsed().as_millis() as u64,
         });
+        let mut out = out;
+        if let Some(script) = &self.script {
+            out["script"] = json!({"statements": script.statements, "completed": st.results.len(),
+                "on_error": script.on_error, "transaction": script.transaction, "tx_outcome": st.tx_outcome});
+        }
         drop(st);
         self.space.notify_one();
         out
@@ -235,6 +324,11 @@ impl Run {
         st.rows_total += 1;
         st.buffer.push_back(Buffered { cells, bytes, truncated });
         st.buffer.len() >= self.limits.page_rows || st.buffered_bytes >= self.limits.page_bytes
+    }
+
+    /// Mark the run ended (a script ends after its transaction does).
+    pub fn finish_now(&self, status: RunStatus) {
+        self.finish(status);
     }
 
     fn finish(&self, status: RunStatus) {
@@ -252,18 +346,35 @@ pub struct RunEnd {
     pub rows_read: u64,
 }
 
-/// Run `stmts` on `conn`, in order, stopping at the first error (§8.2
-/// `on_error: stop`). Every statement reaches the driver only through
-/// `send_authorized`.
+/// Run `stmts` on `conn`, in order. With `stop_on_error` the first failed
+/// statement ends the run (§8.2 `on_error: stop`); otherwise the rest
+/// still run and the run ends `failed` if any did. Every statement reaches
+/// the driver only through `send_authorized`.
 pub async fn produce(conn: Arc<PgConn>, run: Arc<Run>, stmts: Vec<AuthorizedStatement>) -> RunEnd {
-    let deadline = tokio::time::Instant::now() + run.limits.deadline;
+    let (end, status) = produce_unfinished(conn, run.clone(), stmts).await;
+    run.finish(status);
+    end
+}
+
+/// [`produce`] without ending the run: the caller ends it with
+/// [`Run::finish_now`] once its own wrap-up (a script's COMMIT) is done.
+pub async fn produce_unfinished(
+    conn: Arc<PgConn>,
+    run: Arc<Run>,
+    stmts: Vec<AuthorizedStatement>,
+) -> (RunEnd, RunStatus) {
+    let mut deadline = tokio::time::Instant::now() + run.limits.deadline;
     let mut end = RunEnd { context_changed: false, rows_read: 0 };
-    let mut failed = false;
+    let mut any_failed = false;
     for stmt in stmts {
         let meta = stmt.meta().clone();
         if run.is_cancel_requested() {
             break;
         }
+        if run.limits.per_statement_deadline {
+            deadline = tokio::time::Instant::now() + run.limits.deadline;
+        }
+        let mut failed = false;
         end.context_changed |= meta.changes_context();
         let t0 = Instant::now();
         let mut result = StatementResult {
@@ -292,7 +403,7 @@ pub async fn produce(conn: Arc<PgConn>, run: Arc<Run>, stmts: Vec<AuthorizedStat
                 failed = true;
             }
             Some(Ok(q)) => {
-                if !q.columns.is_empty() {
+                if !q.columns.is_empty() && run.limits.keep_rows {
                     let mut st = run.lock();
                     st.statement_index = Some(meta.index);
                     st.columns = q
@@ -333,6 +444,12 @@ pub async fn produce(conn: Arc<PgConn>, run: Arc<Run>, stmts: Vec<AuthorizedStat
                     };
                     if cancel_sent {
                         continue; // draining until the server acknowledges
+                    }
+                    if !run.limits.keep_rows {
+                        // A script counts rows; the grid never sees them.
+                        result.rows_returned += 1;
+                        drop(row);
+                        continue;
                     }
                     let mut cells = Vec::with_capacity(row.len());
                     let mut cut = Vec::new();
@@ -375,20 +492,21 @@ pub async fn produce(conn: Arc<PgConn>, run: Arc<Run>, stmts: Vec<AuthorizedStat
             }
         }
         result.duration_ms = t0.elapsed().as_millis() as u64;
+        let cancelled = result.outcome == "cancelled";
         run.lock().results.push(result);
-        if failed {
+        any_failed |= failed;
+        if failed && (run.limits.stop_on_error || cancelled) {
             break;
         }
     }
     let status = if run.is_cancel_requested() {
         RunStatus::Cancelled
-    } else if failed {
+    } else if any_failed {
         RunStatus::Failed
     } else {
         RunStatus::Done
     };
-    run.finish(status);
-    end
+    (end, status)
 }
 
 #[cfg(test)]
@@ -396,7 +514,24 @@ mod tests {
     use super::*;
 
     fn limits(page_rows: usize, page_bytes: usize) -> RunLimits {
-        RunLimits { deadline: Duration::from_secs(5), page_rows, page_bytes, grid_rows: 100, budget_left: None }
+        RunLimits::execute(Duration::from_secs(5), page_rows, page_bytes, 100, None)
+    }
+
+    #[test]
+    fn a_script_summary_is_reported_once_after_the_end() {
+        let info = ScriptInfo { digest: "d".into(), statements: 3, on_error: "stop", transaction: "single" };
+        let run = Run::with_script("r1".into(), limits(10, 1_000_000), Some(info));
+        assert!(run.take_script_summary().is_none(), "still running");
+        run.set_tx_outcome("rolled_back");
+        run.finish(RunStatus::Failed);
+        let p = run.page();
+        assert_eq!(p["script"]["statements"], 3);
+        assert_eq!(p["script"]["tx_outcome"], "rolled_back");
+        let s = run.take_script_summary().unwrap();
+        assert_eq!(s["skipped"], 3);
+        assert_eq!(s["tx_outcome"], "rolled_back");
+        assert!(run.take_script_summary().is_none(), "once");
+        assert!(Run::new("r2".into(), limits(1, 1)).take_script_summary().is_none(), "not a script");
     }
 
     #[test]
