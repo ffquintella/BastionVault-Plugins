@@ -57,6 +57,10 @@ bastion-plugin-testkit = { path = "../../crates/bastion-plugin-testkit" }
 # plugin.toml is checked against the host's own manifest rules.
 bv_plugin_manifest = { path = "../../crates/bv-plugin-manifest" }
 toml = "1.1"
+# features/sql-browser.md Testing Plan, "Cucumber": run by `live_tests`, which
+# owns the PostgreSQL container, under `make test-dbms`.
+cucumber = "0.23"
+futures = "0.3"
 # Test certificates for the TLS-mode tests, on ring (not aws-lc-rs).
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 

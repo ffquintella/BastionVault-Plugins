@@ -14,6 +14,8 @@ use crate::profile::STATEMENT_CAPS;
 use crate::testutil::{call, code, loopback_config, MockHost};
 use crate::Plugin;
 
+mod cucumber_steps;
+
 const IMAGE: &str = "postgres:16";
 
 struct Pg {
