@@ -12,6 +12,7 @@ use serde_json::{json, Map, Value};
 use crate::api::ApiError;
 use crate::authz::authorize_edit;
 use crate::driver::{DbError, EditSql, PluginSql, TextParam};
+use crate::engine::DbConn;
 use crate::ids;
 use crate::journal;
 use crate::session::{Ctx, Session};
@@ -25,14 +26,14 @@ pub enum EditOp {
 }
 
 impl EditOp {
-    fn capability(self) -> &'static str {
+    pub(crate) fn capability(self) -> &'static str {
         match self {
             Self::Insert => "sql_insert",
             Self::Update => "sql_update",
             Self::Delete => "sql_delete",
         }
     }
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Insert => "insert",
             Self::Update => "update",
@@ -180,6 +181,190 @@ impl Edit {
         Ok((sql.build(), params))
     }
 
+    /// The MySQL / MariaDB statement: backtick identifiers, `?` values, and
+    /// `<=>` (NULL-safe equality) guarding the original values.
+    pub fn build_mysql(&self, key_cols: &[String]) -> Result<(PluginSql, Vec<TextParam>), ApiError> {
+        let mut params = Vec::new();
+        let target = |b: EditSql| b.ident(&self.schema).lit(".").ident(&self.table);
+        let column = |c: &str| SqlIdent::new(c).map_err(|_| ApiError::bad_request("column"));
+        let sql = match self.op {
+            EditOp::Insert => {
+                let mut b = target(EditSql::mysql().lit("INSERT INTO ")).lit(" (");
+                for (i, c) in self.values.keys().enumerate() {
+                    b = if i > 0 { b.lit(", ") } else { b };
+                    b = b.ident(&column(c)?);
+                }
+                b = b.lit(") VALUES (");
+                for (i, v) in self.values.values().enumerate() {
+                    b = if i > 0 { b.lit(", ") } else { b };
+                    b = b.param();
+                    params.push(param_mysql(v));
+                }
+                b.lit(")")
+            }
+            EditOp::Update | EditOp::Delete => {
+                let mut want: Vec<&String> = self.key.keys().collect();
+                let mut have: Vec<&String> = key_cols.iter().collect();
+                want.sort();
+                have.sort();
+                if want != have {
+                    return Err(ApiError::bad_request(format!("`key` must name exactly the key columns {key_cols:?}")));
+                }
+                let mut b = if self.op == EditOp::Update {
+                    let mut b = target(EditSql::mysql().lit("UPDATE ")).lit(" SET ");
+                    for (i, (c, v)) in self.values.iter().enumerate() {
+                        b = if i > 0 { b.lit(", ") } else { b };
+                        b = b.ident(&column(c)?).lit(" = ").param();
+                        params.push(param_mysql(v));
+                    }
+                    b
+                } else {
+                    target(EditSql::mysql().lit("DELETE FROM "))
+                };
+                b = b.lit(" WHERE ");
+                let mut first = true;
+                for (c, v) in &self.key {
+                    b = if first { b } else { b.lit(" AND ") };
+                    first = false;
+                    b = b.ident(&column(c)?).lit(" = ").param();
+                    params.push(param_mysql(v));
+                }
+                for (c, v) in &self.original {
+                    b = b.lit(" AND ").ident(&column(c)?).lit(" <=> ").param();
+                    params.push(param_mysql(v));
+                }
+                b
+            }
+        };
+        Ok((sql.build(), params))
+    }
+
+    /// The SQL Server statement: bracketed identifiers, `@Pn` values, and
+    /// a NULL-safe guard on the original values (each placeholder named
+    /// twice). Values are bound as text; the server converts them to the
+    /// column's type.
+    pub fn build_mssql(&self, key_cols: &[String]) -> Result<(PluginSql, Vec<TextParam>), ApiError> {
+        let mut params = Vec::new();
+        let target = |b: EditSql| b.ident(&self.schema).lit(".").ident(&self.table);
+        let column = |c: &str| SqlIdent::new(c).map_err(|_| ApiError::bad_request("column"));
+        let sql = match self.op {
+            EditOp::Insert => {
+                let mut b = target(EditSql::mssql().lit("INSERT INTO ")).lit(" (");
+                for (i, c) in self.values.keys().enumerate() {
+                    b = if i > 0 { b.lit(", ") } else { b };
+                    b = b.ident(&column(c)?);
+                }
+                b = b.lit(") VALUES (");
+                for (i, v) in self.values.values().enumerate() {
+                    b = if i > 0 { b.lit(", ") } else { b };
+                    b = b.param();
+                    params.push(param(v));
+                }
+                b.lit(")")
+            }
+            EditOp::Update | EditOp::Delete => {
+                let mut want: Vec<&String> = self.key.keys().collect();
+                let mut have: Vec<&String> = key_cols.iter().collect();
+                want.sort();
+                have.sort();
+                if want != have {
+                    return Err(ApiError::bad_request(format!("`key` must name exactly the key columns {key_cols:?}")));
+                }
+                let mut b = if self.op == EditOp::Update {
+                    let mut b = target(EditSql::mssql().lit("UPDATE ")).lit(" SET ");
+                    for (i, (c, v)) in self.values.iter().enumerate() {
+                        b = if i > 0 { b.lit(", ") } else { b };
+                        b = b.ident(&column(c)?).lit(" = ").param();
+                        params.push(param(v));
+                    }
+                    b
+                } else {
+                    target(EditSql::mssql().lit("DELETE FROM "))
+                };
+                b = b.lit(" WHERE ");
+                let mut first = true;
+                for (c, v) in &self.key {
+                    b = if first { b } else { b.lit(" AND ") };
+                    first = false;
+                    b = b.ident(&column(c)?).lit(" = ").param();
+                    params.push(param(v));
+                }
+                for (c, v) in &self.original {
+                    let id = column(c)?;
+                    b = b.lit(" AND (").ident(&id).lit(" = ").param();
+                    params.push(param(v));
+                    let n = b.params();
+                    b = b.lit(" OR (").ident(&id).lit(" IS NULL AND ").param_again(n).lit(" IS NULL))");
+                }
+                b
+            }
+        };
+        Ok((sql.build(), params))
+    }
+
+    /// The Oracle statement (T129): double-quoted identifiers (the
+    /// dictionary's exact names), `:n` values each bound once, and a
+    /// NULL-safe guard on the original values. Values are bound as text and
+    /// converted by the server under the session's pinned NLS formats.
+    pub fn build_oracle(&self, key_cols: &[String]) -> Result<(PluginSql, Vec<TextParam>), ApiError> {
+        let mut params = Vec::new();
+        let target = |b: EditSql| b.ident(&self.schema).lit(".").ident(&self.table);
+        let column = |c: &str| SqlIdent::new(c).map_err(|_| ApiError::bad_request("column"));
+        let sql = match self.op {
+            EditOp::Insert => {
+                let mut b = target(EditSql::oracle().lit("INSERT INTO ")).lit(" (");
+                for (i, c) in self.values.keys().enumerate() {
+                    b = if i > 0 { b.lit(", ") } else { b };
+                    b = b.ident(&column(c)?);
+                }
+                b = b.lit(") VALUES (");
+                for (i, v) in self.values.values().enumerate() {
+                    b = if i > 0 { b.lit(", ") } else { b };
+                    b = b.param();
+                    params.push(param(v));
+                }
+                b.lit(")")
+            }
+            EditOp::Update | EditOp::Delete => {
+                let mut want: Vec<&String> = self.key.keys().collect();
+                let mut have: Vec<&String> = key_cols.iter().collect();
+                want.sort();
+                have.sort();
+                if want != have {
+                    return Err(ApiError::bad_request(format!("`key` must name exactly the key columns {key_cols:?}")));
+                }
+                let mut b = if self.op == EditOp::Update {
+                    let mut b = target(EditSql::oracle().lit("UPDATE ")).lit(" SET ");
+                    for (i, (c, v)) in self.values.iter().enumerate() {
+                        b = if i > 0 { b.lit(", ") } else { b };
+                        b = b.ident(&column(c)?).lit(" = ").param();
+                        params.push(param(v));
+                    }
+                    b
+                } else {
+                    target(EditSql::oracle().lit("DELETE FROM "))
+                };
+                b = b.lit(" WHERE ");
+                let mut first = true;
+                for (c, v) in &self.key {
+                    b = if first { b } else { b.lit(" AND ") };
+                    first = false;
+                    b = b.ident(&column(c)?).lit(" = ").param();
+                    params.push(param(v));
+                }
+                for (c, v) in &self.original {
+                    let id = column(c)?;
+                    b = b.lit(" AND (").ident(&id).lit(" = ").param();
+                    params.push(param(v));
+                    b = b.lit(" OR (").ident(&id).lit(" IS NULL AND ").param().lit(" IS NULL))");
+                    params.push(param(v));
+                }
+                b
+            }
+        };
+        Ok((sql.build(), params))
+    }
+
     pub fn changed_columns(&self) -> Vec<String> {
         self.values.keys().cloned().collect()
     }
@@ -194,6 +379,15 @@ fn param(v: &Value) -> TextParam {
         Value::Number(n) => Some(n.to_string()),
         other => Some(other.to_string()),
     })
+}
+
+/// A JSON value bound for MySQL / MariaDB: booleans as 1 / 0 (MySQL's
+/// BOOLEAN is TINYINT, and `'true'` is not a number to it).
+fn param_mysql(v: &Value) -> TextParam {
+    match v {
+        Value::Bool(b) => TextParam(Some(if *b { "1" } else { "0" }.to_string())),
+        other => param(other),
+    }
 }
 
 fn db(e: DbError) -> ApiError {
@@ -214,17 +408,23 @@ pub fn apply(cx: &Ctx<'_>, s: &Arc<Session>, data: &Map<String, Value>) -> Resul
     // Exclusive: no run or other edit may interleave with the edit's
     // BEGIN … COMMIT (or savepoint) bracket on the session's connection.
     let _op = s.begin_op()?;
-    if let Some(why) = s.conn().wire().taint() {
+    let conn = match s.conn() {
+        DbConn::Pg(c) => c.clone(),
+        DbConn::My(c) => return crate::mysql::browse::apply(cx, s, c, edit, ticket),
+        DbConn::Ms(c) => return crate::mssql::browse::apply(cx, s, c, edit, ticket),
+        DbConn::Ora(c) => return crate::oracle::browse::apply(cx, s, c, edit, ticket),
+    };
+    if let Some(why) = conn.wire().taint() {
         return Err(ApiError::refused("session_tainted", why));
     }
-    let tx = s.conn().wire().tx();
+    let tx = conn.wire().tx();
     if tx == TxStatus::Failed {
         return Err(ApiError::refused("transaction_aborted", "the open transaction failed; roll it back first"));
     }
     let (schema, table) = (edit.schema.as_str().to_string(), edit.table.as_str().to_string());
     let key_cols = cx
         .rt
-        .block_on(crate::objects::edit_key(s, &schema, &table))
+        .block_on(crate::objects::edit_key(&conn, &schema, &table))
         .map_err(db)?
         .ok_or_else(|| ApiError::refused("not_editable", "the table has no primary key or non-null unique key"))?;
     for c in &key_cols {
@@ -275,7 +475,6 @@ pub fn apply(cx: &Ctx<'_>, s: &Arc<Session>, data: &Map<String, Value>) -> Resul
     let saved_path = PluginSql::guarded(sql!("SELECT pg_catalog.current_setting('search_path')"));
     let pin_path = PluginSql::guarded(sql!("SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)"));
     let restore_path = PluginSql::guarded(sql!("SELECT pg_catalog.set_config('search_path', $1::text, true)"));
-    let conn = s.conn().clone();
     let result: Result<(u64, bool), DbError> = cx.rt.block_on(async {
         conn.internal_execute(&open).await?;
         let saved = if in_tx {
@@ -355,6 +554,27 @@ mod tests {
         );
         let p: Vec<Option<String>> = params.into_iter().map(|p| p.0).collect();
         assert_eq!(p, vec![Some("new@example.com".into()), Some("7".into()), Some("old@example.com".into())]);
+    }
+
+    #[test]
+    fn oracle_edits_quote_exactly_and_bind_each_value_once() {
+        let e = Edit::parse(&data(json!({"object": {"schema": "APP", "name": "T"}, "op": "update",
+            "key": {"ID": 7}, "values": {"NAME": "new"}, "original": {"NAME": null}})))
+        .unwrap();
+        let (sql, params) = e.build_oracle(&["ID".into()]).unwrap();
+        assert_eq!(
+            sql.as_str(),
+            "UPDATE \"APP\".\"T\" SET \"NAME\" = :1 WHERE \"ID\" = :2 AND (\"NAME\" = :3 OR (\"NAME\" IS NULL AND :4 IS NULL))"
+        );
+        let p: Vec<Option<String>> = params.into_iter().map(|p| p.0).collect();
+        assert_eq!(p, vec![Some("new".into()), Some("7".into()), None, None]);
+        let e = Edit::parse(&data(json!({"object": {"schema": "APP", "name": "T"}, "op": "insert",
+            "values": {"ID": 1, "NAME": "x"}})))
+        .unwrap();
+        assert_eq!(
+            e.build_oracle(&[]).unwrap().0.as_str(),
+            "INSERT INTO \"APP\".\"T\" (\"ID\", \"NAME\") VALUES (:1, :2)"
+        );
     }
 
     #[test]

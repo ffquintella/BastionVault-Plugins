@@ -56,6 +56,12 @@ pub fn capabilities(f: &Facts) -> BTreeSet<&'static str> {
 
 /// `READ v2/sessions/<id>/ceiling`.
 pub fn probe(cx: &Ctx<'_>, s: &Arc<Session>) -> Result<Value, ApiError> {
+    let conn = match s.conn() {
+        crate::engine::DbConn::Pg(c) => c,
+        crate::engine::DbConn::My(c) => return crate::mysql::browse::probe(cx, s, c),
+        crate::engine::DbConn::Ms(c) => return crate::mssql::browse::probe(cx, s, c),
+        crate::engine::DbConn::Ora(c) => return crate::oracle::browse::probe(cx, s, c),
+    };
     let check = Check::server("sql_select");
     let v = cx.host.sql_authorize(&s.resource, std::slice::from_ref(&check))?;
     if !crate::host::verdicts_match(std::slice::from_ref(&check), &v) || !v[0].allowed {
@@ -84,7 +90,7 @@ pub fn probe(cx: &Ctx<'_>, s: &Arc<Session>) -> Result<Value, ApiError> {
          FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER"
     ));
     let rows =
-        cx.rt.block_on(s.conn().internal_query(&q, &[])).map_err(|e| ApiError::refused("database_error", e.message))?;
+        cx.rt.block_on(conn.internal_query(&q, &[])).map_err(|e| ApiError::refused("database_error", e.message))?;
     let r = rows.first().ok_or_else(|| ApiError::internal("the login's role is not visible"))?;
     let b = |i: usize| r.try_get::<_, bool>(i).unwrap_or(false);
     let facts = Facts {

@@ -38,34 +38,89 @@ impl PluginSql {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// `KILL QUERY <id>` for MySQL / MariaDB cancellation (§6.2). The only
+    /// runtime part is the connection id the driver reported, an integer.
+    pub fn kill_query(connection_id: u32) -> Self {
+        Self(format!("KILL QUERY {connection_id}"))
+    }
+
+    /// A SQL Server row edit followed by its own row count: `@@ROWCOUNT`
+    /// read right after it (so a trigger's writes are not counted), with
+    /// `NOCOUNT` scoped to the `sp_executesql` batch. Only a plugin-authored
+    /// edit goes in; the wrapper is literal.
+    pub fn mssql_counted(edit: &PluginSql) -> Self {
+        Self(format!("SET NOCOUNT ON; {}; SELECT CAST(@@ROWCOUNT AS bigint)", edit.0))
+    }
 }
 
 /// Builder for structured row edits (§7). Identifiers are `SqlIdent`s
-/// (`[A-Za-z_][A-Za-z0-9_]{0,62}`), double-quoted so their case is kept;
-/// every value is a bound placeholder.
+/// (`[A-Za-z_][A-Za-z0-9_]{0,62}`), quoted so their case is kept (double
+/// quotes for PostgreSQL, backticks for MySQL / MariaDB, brackets for SQL
+/// Server); every value is a bound placeholder (`$n`, `?` or `@Pn`).
 #[derive(Default)]
 pub struct EditSql {
     text: String,
     params: usize,
+    mysql: bool,
+    mssql: bool,
+    oracle: bool,
 }
 
 impl EditSql {
+    /// The MySQL / MariaDB form: backticks and `?` placeholders.
+    pub fn mysql() -> Self {
+        Self { mysql: true, ..Self::default() }
+    }
+
+    /// The SQL Server form: brackets and `@P1`, `@P2`, … placeholders.
+    pub fn mssql() -> Self {
+        Self { mssql: true, ..Self::default() }
+    }
+
+    /// The Oracle form: double quotes (`oracle_quoted`) and `:1`, `:2`, …
+    /// placeholders, each used once (positional binding, T129).
+    pub fn oracle() -> Self {
+        Self { oracle: true, ..Self::default() }
+    }
+
+    /// The placeholder `n` again (SQL Server can name one twice).
+    pub fn param_again(mut self, n: usize) -> Self {
+        self.text.push_str(&format!("@P{n}"));
+        self
+    }
+
     pub fn lit(mut self, s: &'static str) -> Self {
         self.text.push_str(s);
         self
     }
 
     pub fn ident(mut self, id: &SqlIdent) -> Self {
-        self.text.push('"');
-        self.text.push_str(id.as_str());
-        self.text.push('"');
+        let quoted = if self.mysql {
+            id.backticked()
+        } else if self.mssql {
+            id.bracketed()
+        } else if self.oracle {
+            id.oracle_quoted()
+        } else {
+            id.double_quoted()
+        };
+        self.text.push_str(&quoted);
         self
     }
 
-    /// The next `$n` placeholder.
+    /// The next placeholder.
     pub fn param(mut self) -> Self {
         self.params += 1;
-        self.text.push_str(&format!("${}", self.params));
+        if self.mysql {
+            self.text.push('?');
+        } else if self.mssql {
+            self.text.push_str(&format!("@P{}", self.params));
+        } else if self.oracle {
+            self.text.push_str(&format!(":{}", self.params));
+        } else {
+            self.text.push_str(&format!("${}", self.params));
+        }
         self
     }
 
@@ -138,7 +193,7 @@ pub struct ConnectError {
 }
 
 impl ConnectError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
     }
 }
@@ -172,7 +227,11 @@ fn catalog_ok(c: &str) -> bool {
 }
 
 /// Resolve `host:port` and keep the addresses `allowed_networks` permits.
-async fn resolve(profile: &Profile, allowed: &[Cidr], denied: &[Cidr]) -> Result<Vec<SocketAddr>, ConnectError> {
+pub(crate) async fn resolve(
+    profile: &Profile,
+    allowed: &[Cidr],
+    denied: &[Cidr],
+) -> Result<Vec<SocketAddr>, ConnectError> {
     let host = profile.host.trim_start_matches('[').trim_end_matches(']');
     let found: Vec<SocketAddr> = tokio::net::lookup_host((host, profile.port))
         .await
@@ -453,6 +512,47 @@ mod tests {
             .param();
         assert_eq!(e.params(), 2);
         assert_eq!(e.build().as_str(), "UPDATE \"Users\" SET \"email\" = $1 WHERE \"email\" = $2");
+        let m = EditSql::mysql()
+            .lit("UPDATE ")
+            .ident(&t)
+            .lit(" SET ")
+            .ident(&c)
+            .lit(" = ")
+            .param()
+            .lit(" WHERE ")
+            .ident(&c)
+            .lit(" <=> ")
+            .param();
+        assert_eq!(m.params(), 2);
+        assert_eq!(m.build().as_str(), "UPDATE `Users` SET `email` = ? WHERE `email` <=> ?");
+        assert_eq!(PluginSql::kill_query(42).as_str(), "KILL QUERY 42");
+        let s = EditSql::mssql()
+            .lit("UPDATE ")
+            .ident(&t)
+            .lit(" SET ")
+            .ident(&c)
+            .lit(" = ")
+            .param()
+            .lit(" WHERE (")
+            .ident(&c)
+            .lit(" = ")
+            .param()
+            .lit(" OR (")
+            .ident(&c)
+            .lit(" IS NULL AND ")
+            .param_again(2)
+            .lit(" IS NULL))");
+        assert_eq!(s.params(), 2);
+        let built = s.build();
+        assert_eq!(
+            built.as_str(),
+            "UPDATE [Users] SET [email] = @P1 WHERE ([email] = @P2 OR ([email] IS NULL AND @P2 IS NULL))"
+        );
+        assert_eq!(
+            PluginSql::mssql_counted(&built).as_str(),
+            "SET NOCOUNT ON; UPDATE [Users] SET [email] = @P1 WHERE ([email] = @P2 OR ([email] IS NULL AND @P2 IS NULL)); \
+             SELECT CAST(@@ROWCOUNT AS bigint)"
+        );
         assert_eq!(PluginSql::guarded(sql!("SELECT 1")).as_str(), "SELECT 1");
     }
 

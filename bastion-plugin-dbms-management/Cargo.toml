@@ -29,11 +29,42 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Sessions and runs outlive the invocation that started them (§6.2): the
 # database work runs on this runtime, between invocations.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 # PostgreSQL driver (Phase 0 item 4). No `with-*` features and no TLS
 # feature: TLS is the rustls connector in src/tls.rs, so neither openssl-sys
 # nor native-tls enters the graph. Same line as dynamic-engine-plugins/.
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+# MySQL / MariaDB driver (T127, Phase 6). Default features off: `minimal-rust`
+# (flate2 on miniz_oxide, no zlib C build) and `rustls-tls` on the `ring`
+# provider with `tls12` only, so neither openssl-sys, native-tls nor
+# aws-lc-sys enters the graph (`make test-dbms` checks).
+mysql_async = { version = "0.37.1", default-features = false, features = [
+    "minimal-rust",
+    "rustls-tls",
+    "ring",
+    "tls12",
+    # MariaDB's ed25519 authentication (curve25519-dalek, pure Rust).
+    "client_ed25519",
+] }
+# SQL Server driver (T128, Phase 7). Default features off: no TLS backend
+# (its rustls backend pins the aws_lc_rs provider, which plugins-ext/ does not
+# carry, and native-tls / vendored-openssl are banned), no Windows / Kerberos
+# authentication. `tds73` reads date, time, datetime2 and datetimeoffset.
+# TLS is negotiated by the plugin itself, on ring (src/mssql/tds_tls.rs).
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73"] }
+# Oracle (T129): the Sans-I/O TNS/TTC protocol core under the plugin's own
+# session layer (src/oracle/tns.rs; TLS on ring). Pure Rust, forbid(unsafe),
+# RustCrypto only, no I/O or TLS; the drivers pull aws-lc-sys or an async
+# runtime (features/sql-browser.md, Phase 8, Oracle). Pinned exactly: one
+# maintainer, renamed once, so each upgrade is a reviewed change (this crate
+# is publish = false, so the pin never reaches a published manifest).
+oraclemcp-driver-cx-protocol = { version = "=0.9.2", default-features = false }
+# tiberius speaks futures-io; the plugin's streams are tokio's.
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+# No LOCAL INFILE handler is ever installed. src/mysql/conn.rs says how one
+# statement per round trip holds although the driver always advertises
+# CLIENT_MULTI_STATEMENTS.
+#
 # Row streams are polled with StreamExt; already in the graph through
 # tokio-postgres.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

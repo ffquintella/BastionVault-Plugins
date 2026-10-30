@@ -23,6 +23,7 @@ use zeroize::Zeroize;
 use crate::api::ApiError;
 use crate::authz::AuthorizedStatement;
 use crate::driver::{DbError, PgConn, PluginSql, TextParam};
+use crate::engine::{DbConn, Streamed};
 use crate::values::{self, Cell};
 
 /// One pull returns at most this many bytes (§8.1).
@@ -607,6 +608,21 @@ impl ExportJob {
 /// (pausing while it is full), and restore the timeout. Every caller row
 /// reaches the database only through `send_authorized`.
 pub async fn produce(
+    conn: DbConn,
+    job: Arc<ExportJob>,
+    stmt: AuthorizedStatement,
+    opts: ExportOptions,
+    restore_timeout: Duration,
+) {
+    match conn {
+        DbConn::Pg(c) => produce_pg(c, job, stmt, opts, restore_timeout).await,
+        DbConn::My(c) => produce_chan(Streamed::My(c), job, stmt, opts).await,
+        DbConn::Ms(c) => produce_chan(Streamed::Ms(c), job, stmt, opts).await,
+        DbConn::Ora(c) => produce_chan(Streamed::Ora(c), job, stmt, opts).await,
+    }
+}
+
+async fn produce_pg(
     conn: Arc<PgConn>,
     job: Arc<ExportJob>,
     stmt: AuthorizedStatement,
@@ -715,6 +731,98 @@ async fn stream(
         None => (JobStatus::Done, None),
         Some(JobStatus::Failed) => (JobStatus::Failed, Some(DbError::plugin("the export passed its deadline"))),
         Some(s) => (s, None),
+    }
+}
+
+/// The MySQL / MariaDB and SQL Server export. The session's server-side
+/// timeout stays as it is: the export's own deadline stops the statement
+/// (`KILL QUERY`, or the TDS attention signal).
+async fn produce_chan(conn: Streamed, job: Arc<ExportJob>, stmt: AuthorizedStatement, opts: ExportOptions) {
+    let (status, error) = stream_chan(&conn, &job, stmt, opts).await;
+    job.finish(status, error);
+}
+
+async fn stream_chan(
+    conn: &Streamed,
+    job: &ExportJob,
+    stmt: AuthorizedStatement,
+    opts: ExportOptions,
+) -> (JobStatus, Option<DbError>) {
+    let deadline = tokio::time::Instant::now() + job.limits.deadline + Duration::from_secs(5);
+    let mut q = tokio::select! {
+        r = conn.send_authorized(stmt) => match r {
+            Ok(q) => q,
+            Err(e) => return (JobStatus::Failed, Some(e)),
+        },
+        _ = tokio::time::sleep_until(deadline) => {
+            let _ = conn.cancel().await;
+            return (JobStatus::Failed, Some(DbError::plugin("the export did not start before its deadline")));
+        }
+        _ = job.cancel.notified() => {
+            let _ = conn.cancel().await;
+            return (JobStatus::Cancelled, None);
+        }
+    };
+    let cols: Vec<Col> =
+        q.columns.iter().map(|c| Col { name: c.name.clone(), numeric: c.numeric, bytea: c.binary }).collect();
+    let renderer = Renderer::new(opts, cols);
+    let mut stop: Option<JobStatus> = None;
+    if job.push(renderer.header(), false) == Pushed::ByteLimit {
+        let _ = conn.cancel().await;
+        stop = Some(JobStatus::LimitReached("byte_limit"));
+    }
+    let mut failure = None;
+    loop {
+        let next = tokio::select! {
+            r = q.rows.recv() => r,
+            _ = tokio::time::sleep_until(deadline), if stop.is_none() => {
+                let _ = conn.cancel().await;
+                stop = Some(JobStatus::Failed);
+                continue;
+            }
+            _ = job.cancel.notified(), if stop.is_none() => {
+                let _ = conn.cancel().await;
+                stop = Some(JobStatus::Cancelled);
+                continue;
+            }
+        };
+        let mut cells = match next {
+            None => break,
+            Some(Err(e)) => {
+                failure = Some(e);
+                break;
+            }
+            Some(Ok(cells)) => cells,
+        };
+        if stop.is_some() {
+            cells.iter_mut().for_each(scrub);
+            continue; // draining until the server ends the statement
+        }
+        if job.rows() >= job.limits.max_rows {
+            cells.iter_mut().for_each(scrub);
+            let _ = conn.cancel().await;
+            stop = Some(JobStatus::LimitReached("row_limit"));
+            continue;
+        }
+        let bytes = renderer.row(&cells);
+        cells.iter_mut().for_each(scrub);
+        if job.push(bytes, true) == Pushed::ByteLimit {
+            let _ = conn.cancel().await;
+            stop = Some(JobStatus::LimitReached("byte_limit"));
+            continue;
+        }
+        job.wait_for_space(deadline).await;
+        if job.is_cancel_requested() && stop.is_none() {
+            let _ = conn.cancel().await;
+            stop = Some(JobStatus::Cancelled);
+        }
+    }
+    let ended = q.end.await.unwrap_or_else(|_| Err(DbError::plugin("the statement task ended")));
+    match (stop, failure.or(ended.err())) {
+        (None, None) => (JobStatus::Done, None),
+        (None, Some(e)) => (JobStatus::Failed, Some(e)),
+        (Some(JobStatus::Failed), _) => (JobStatus::Failed, Some(DbError::plugin("the export passed its deadline"))),
+        (Some(s), _) => (s, None),
     }
 }
 

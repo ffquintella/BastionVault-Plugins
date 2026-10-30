@@ -14,7 +14,7 @@ abi_version = "1.4"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 size   = 0
 
-description = "SQL browser: PostgreSQL sessions where every statement is classified, authorized by BastionVault and audited; the database login never leaves the server."
+description = "SQL browser: PostgreSQL, MySQL, MariaDB, SQL Server and Oracle sessions where every statement is classified, authorized by BastionVault and audited; the database login never leaves the server."
 
 [capabilities]
 # Sessions hold a live database connection between invocations (§6.1).

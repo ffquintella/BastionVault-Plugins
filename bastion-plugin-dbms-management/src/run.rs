@@ -16,6 +16,7 @@ use zeroize::Zeroize;
 
 use crate::authz::{AuthorizedStatement, StatementMeta};
 use crate::driver::{DbError, PgConn};
+use crate::engine::{DbConn, Streamed};
 use crate::values::{self, Cell};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,7 +351,7 @@ pub struct RunEnd {
 /// statement ends the run (§8.2 `on_error: stop`); otherwise the rest
 /// still run and the run ends `failed` if any did. Every statement reaches
 /// the driver only through `send_authorized`.
-pub async fn produce(conn: Arc<PgConn>, run: Arc<Run>, stmts: Vec<AuthorizedStatement>) -> RunEnd {
+pub async fn produce(conn: DbConn, run: Arc<Run>, stmts: Vec<AuthorizedStatement>) -> RunEnd {
     let (end, status) = produce_unfinished(conn, run.clone(), stmts).await;
     run.finish(status);
     end
@@ -358,7 +359,16 @@ pub async fn produce(conn: Arc<PgConn>, run: Arc<Run>, stmts: Vec<AuthorizedStat
 
 /// [`produce`] without ending the run: the caller ends it with
 /// [`Run::finish_now`] once its own wrap-up (a script's COMMIT) is done.
-pub async fn produce_unfinished(
+pub async fn produce_unfinished(conn: DbConn, run: Arc<Run>, stmts: Vec<AuthorizedStatement>) -> (RunEnd, RunStatus) {
+    match conn {
+        DbConn::Pg(c) => produce_pg_unfinished(c, run, stmts).await,
+        DbConn::My(c) => produce_chan_unfinished(Streamed::My(c), run, stmts).await,
+        DbConn::Ms(c) => produce_chan_unfinished(Streamed::Ms(c), run, stmts).await,
+        DbConn::Ora(c) => produce_chan_unfinished(Streamed::Ora(c), run, stmts).await,
+    }
+}
+
+async fn produce_pg_unfinished(
     conn: Arc<PgConn>,
     run: Arc<Run>,
     stmts: Vec<AuthorizedStatement>,
@@ -483,6 +493,174 @@ pub async fn produce_unfinished(
                     }
                 }
                 result.rows_affected = rows.rows_affected();
+                if cancel_sent && result.truncated {
+                    result.outcome = "ok";
+                    failed = false;
+                } else if cancel_sent {
+                    failed = true;
+                }
+            }
+        }
+        result.duration_ms = t0.elapsed().as_millis() as u64;
+        let cancelled = result.outcome == "cancelled";
+        run.lock().results.push(result);
+        any_failed |= failed;
+        if failed && (run.limits.stop_on_error || cancelled) {
+            break;
+        }
+    }
+    let status = if run.is_cancel_requested() {
+        RunStatus::Cancelled
+    } else if any_failed {
+        RunStatus::Failed
+    } else {
+        RunStatus::Done
+    };
+    (end, status)
+}
+
+/// The MySQL / MariaDB and SQL Server producer: the same run, paging and
+/// limits as the PostgreSQL one. The driver task streams rows through a
+/// bounded channel (`send_authorized`); the deadline, a cancel and the grid
+/// cap stop the statement (`KILL QUERY` on a side connection, or the TDS
+/// attention signal), and the rows already on their way are drained until
+/// the server ends it.
+async fn produce_chan_unfinished(
+    conn: Streamed,
+    run: Arc<Run>,
+    stmts: Vec<AuthorizedStatement>,
+) -> (RunEnd, RunStatus) {
+    let mut deadline = tokio::time::Instant::now() + run.limits.deadline;
+    let mut end = RunEnd { context_changed: false, rows_read: 0 };
+    let mut any_failed = false;
+    for stmt in stmts {
+        let meta = stmt.meta().clone();
+        if run.is_cancel_requested() {
+            break;
+        }
+        if run.limits.per_statement_deadline {
+            deadline = tokio::time::Instant::now() + run.limits.deadline;
+        }
+        let mut failed = false;
+        end.context_changed |= meta.changes_context();
+        let t0 = Instant::now();
+        let mut result = StatementResult {
+            meta: meta.clone(),
+            outcome: "ok",
+            rows_affected: None,
+            rows_returned: 0,
+            duration_ms: 0,
+            error: None,
+            truncated: false,
+        };
+        // Starting the statement (sending it, reading its column list) is
+        // watched too: a slow statement is killed, never waited on.
+        let mut cancel_sent = false;
+        let started = {
+            let send = conn.send_authorized(stmt);
+            tokio::pin!(send);
+            loop {
+                tokio::select! {
+                    r = &mut send => break r,
+                    _ = tokio::time::sleep_until(deadline), if !cancel_sent => {
+                        let _ = conn.cancel().await;
+                        cancel_sent = true;
+                        result.outcome = "timeout";
+                    }
+                    _ = run.cancel.notified(), if !cancel_sent => {
+                        let _ = conn.cancel().await;
+                        cancel_sent = true;
+                        result.outcome = "cancelled";
+                    }
+                }
+            }
+        };
+        match started {
+            Err(e) => {
+                if !cancel_sent {
+                    result.outcome = "error";
+                    result.error = Some(e);
+                }
+                failed = true;
+            }
+            Ok(mut q) => {
+                if !q.columns.is_empty() && run.limits.keep_rows {
+                    let mut st = run.lock();
+                    st.statement_index = Some(meta.index);
+                    st.columns = q.columns.iter().map(|c| c.json.clone()).collect();
+                }
+                let mut stream_error = None;
+                loop {
+                    let next = tokio::select! {
+                        r = q.rows.recv() => r,
+                        _ = tokio::time::sleep_until(deadline), if !cancel_sent => {
+                            let _ = conn.cancel().await;
+                            cancel_sent = true;
+                            result.outcome = "timeout";
+                            continue;
+                        }
+                        _ = run.cancel.notified(), if !cancel_sent => {
+                            let _ = conn.cancel().await;
+                            cancel_sent = true;
+                            result.outcome = "cancelled";
+                            continue;
+                        }
+                    };
+                    let cells = match next {
+                        None => break,
+                        Some(Err(e)) => {
+                            stream_error = Some(e);
+                            break;
+                        }
+                        Some(Ok(cells)) => cells,
+                    };
+                    if cancel_sent {
+                        continue; // draining until the server ends the statement
+                    }
+                    if !run.limits.keep_rows {
+                        result.rows_returned += 1;
+                        continue;
+                    }
+                    let mut row = Vec::with_capacity(cells.len());
+                    let mut cut = Vec::new();
+                    for (i, v) in cells.into_iter().enumerate() {
+                        let (v, full) = values::cap(v);
+                        if let Some(full) = full {
+                            cut.push((i, full));
+                        }
+                        row.push(v);
+                    }
+                    result.rows_returned += 1;
+                    end.rows_read += 1;
+                    let full = run.push_row(row, cut);
+                    let budget_hit = run.limits.budget_left.is_some_and(|b| end.rows_read >= b);
+                    if result.rows_returned >= run.limits.grid_rows || budget_hit {
+                        let _ = conn.cancel().await;
+                        cancel_sent = true;
+                        result.truncated = true;
+                        if budget_hit {
+                            run.lock().budget_exhausted = true;
+                        }
+                        continue;
+                    }
+                    if full {
+                        tokio::select! {
+                            _ = run.space.notified() => {}
+                            _ = tokio::time::sleep_until(deadline) => {}
+                        }
+                    }
+                }
+                let ended = q.end.await.unwrap_or_else(|_| Err(DbError::plugin("the statement task ended")));
+                match (ended, stream_error) {
+                    (Ok(n), None) => result.rows_affected = Some(n),
+                    (Err(e), _) | (Ok(_), Some(e)) => {
+                        if !cancel_sent {
+                            result.outcome = "error";
+                            result.error = Some(e);
+                        }
+                        failed = true;
+                    }
+                }
                 if cancel_sent && result.truncated {
                     result.outcome = "ok";
                     failed = false;

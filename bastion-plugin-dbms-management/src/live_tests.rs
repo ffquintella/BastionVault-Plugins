@@ -15,6 +15,9 @@ use crate::testutil::{call, code, loopback_config, MockHost};
 use crate::Plugin;
 
 mod cucumber_steps;
+mod mssql;
+mod mysql;
+mod oracle;
 
 const IMAGE: &str = "postgres:16";
 

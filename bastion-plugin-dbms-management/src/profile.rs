@@ -107,6 +107,10 @@ pub struct Profile {
     pub host: String,
     pub port: u16,
     pub catalog: Option<String>,
+    /// SQL Server named instance (§5.1): the server must confirm it before
+    /// the login is sent. The port is the profile's; SQL Browser is never
+    /// asked.
+    pub instance: Option<String>,
     pub tls: Tls,
     pub ceiling: BTreeSet<&'static str>,
     pub require_mfa: bool,
@@ -199,6 +203,7 @@ impl Profile {
             host: req("host")?,
             port: port as u16,
             catalog: opt(v, "catalog")?,
+            instance: opt(v, "instance")?,
             tls: Tls { mode, server_name: opt(tls, "server_name")?, ca_pem: opt(tls, "ca_pem")? },
             ceiling,
             require_mfa: v.get("require_mfa").and_then(Value::as_bool).ok_or("bad `require_mfa`")?,

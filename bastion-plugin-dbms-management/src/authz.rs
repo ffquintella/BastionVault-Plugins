@@ -120,8 +120,14 @@ pub struct EarlyRefusal {
 
 /// Classify `text`. `single`: the `execute` rule (§8.2), one statement not
 /// counting transaction control.
-pub fn prepare(text: &str, lexer: LexerSettings, ctx: &NameContext, single: bool) -> Result<Prepared, EarlyRefusal> {
-    let each = classify_each(Dialect::PostgreSql, lexer, text, ctx).map_err(|u| EarlyRefusal {
+pub fn prepare(
+    dialect: Dialect,
+    text: &str,
+    lexer: LexerSettings,
+    ctx: &NameContext,
+    single: bool,
+) -> Result<Prepared, EarlyRefusal> {
+    let each = classify_each(dialect, lexer, text, ctx).map_err(|u| EarlyRefusal {
         code: "unclassifiable",
         message: format!("the input cannot be split into statements: {}", u.reason),
         statement: None,
@@ -517,7 +523,8 @@ mod tests {
         text: &str,
         res: &Resolutions,
     ) -> Result<(Decision, Option<Vec<AuthorizedStatement>>), ApiError> {
-        let p = prepare(text, SCS, &ctx(), true).map_err(|e| ApiError::refused(e.code, e.message))?;
+        let p =
+            prepare(Dialect::PostgreSql, text, SCS, &ctx(), true).map_err(|e| ApiError::refused(e.code, e.message))?;
         authorize(h, "db", "sess-1", p, res, Mode::Execute)
     }
 
@@ -562,7 +569,7 @@ mod tests {
         run(&h, "SELECT * FROM t", &Resolutions::new()).unwrap();
         let asked = h.authorized.lock().unwrap()[0].clone();
         assert_eq!(asked, vec![Check::object("sql_select", "app", "", "t")], "no schema: the objects root decides");
-        let p = prepare("SELECT * FROM t", SCS, &ctx(), true).unwrap();
+        let p = prepare(Dialect::PostgreSql, "SELECT * FROM t", SCS, &ctx(), true).unwrap();
         let mut res = Resolutions::new();
         for r in p.unresolved() {
             res.insert(r, Some("sales".into()));
@@ -581,9 +588,12 @@ mod tests {
             ("SELECT 'unterminated", "unclassifiable"),
             ("  -- only a comment", "empty"),
         ] {
-            assert_eq!(prepare(text, SCS, &ctx(), true).unwrap_err().code, code, "{text}");
+            assert_eq!(prepare(Dialect::PostgreSql, text, SCS, &ctx(), true).unwrap_err().code, code, "{text}");
         }
-        assert!(prepare("SELECT 1; SELECT 2", SCS, &ctx(), false).is_ok(), "a script may hold several");
+        assert!(
+            prepare(Dialect::PostgreSql, "SELECT 1; SELECT 2", SCS, &ctx(), false).is_ok(),
+            "a script may hold several"
+        );
     }
 
     /// §8.1: an export needs only `sql_select`, plus `sql_export` on every
@@ -592,7 +602,8 @@ mod tests {
     #[test]
     fn exports_need_select_only_and_sql_export_on_what_they_read() {
         let h = host();
-        let p = prepare("SELECT a FROM public.t JOIN public.u USING (id)", SCS, &ctx(), true).unwrap();
+        let p =
+            prepare(Dialect::PostgreSql, "SELECT a FROM public.t JOIN public.u USING (id)", SCS, &ctx(), true).unwrap();
         let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap();
         assert_eq!(minted.unwrap().len(), 1);
         let asked = h.authorized.lock().unwrap()[0].clone();
@@ -601,12 +612,12 @@ mod tests {
             assert!(asked.contains(&Check::object("sql_export", "app", "public", o)), "{asked:?}");
         }
         assert_eq!(d.capabilities(), ["sql_export", "sql_select"].into_iter().collect());
-        let p = prepare("SELECT now()", SCS, &ctx(), true).unwrap();
+        let p = prepare(Dialect::PostgreSql, "SELECT now()", SCS, &ctx(), true).unwrap();
         authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap();
         assert!(h.authorized.lock().unwrap()[1].contains(&Check::server("sql_export")));
 
         h.allow(|c| c.capability == "sql_select");
-        let p = prepare("SELECT * FROM public.t", SCS, &ctx(), true).unwrap();
+        let p = prepare(Dialect::PostgreSql, "SELECT * FROM public.t", SCS, &ctx(), true).unwrap();
         let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap();
         assert!(minted.is_none(), "sql_select alone does not export");
         assert_eq!(d.message(), "statement 1 needs `sql_export` on `app.public.t`");
@@ -624,7 +635,7 @@ mod tests {
             "TABLE t",
         ] {
             let asked_before = h.authorized.lock().unwrap().len();
-            let p = prepare(text, SCS, &ctx(), true).unwrap();
+            let p = prepare(Dialect::PostgreSql, text, SCS, &ctx(), true).unwrap();
             let e = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Export).unwrap_err();
             assert!(e.code.starts_with("export_"), "{text}: {e}");
             assert_eq!(h.authorized.lock().unwrap().len(), asked_before, "{text}: the host was asked");
@@ -637,7 +648,8 @@ mod tests {
     fn scripts_need_sql_script_and_are_all_or_nothing() {
         let h = host();
         h.allow(|c| c.capability != "sql_script");
-        let p = prepare("SELECT 1; UPDATE public.t SET a = 1 WHERE b = 2", SCS, &ctx(), false).unwrap();
+        let p = prepare(Dialect::PostgreSql, "SELECT 1; UPDATE public.t SET a = 1 WHERE b = 2", SCS, &ctx(), false)
+            .unwrap();
         let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Script).unwrap();
         assert!(minted.is_none());
         assert_eq!(d.message(), "the script needs `sql_script` on the server");
@@ -645,14 +657,14 @@ mod tests {
         assert_eq!(d.request_report()[0]["allowed"], false);
 
         h.allow(|c| c.capability != "sql_drop");
-        let p = prepare("SELECT 1; DROP TABLE public.t; SELECT 2", SCS, &ctx(), false).unwrap();
+        let p = prepare(Dialect::PostgreSql, "SELECT 1; DROP TABLE public.t; SELECT 2", SCS, &ctx(), false).unwrap();
         let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Script).unwrap();
         assert!(minted.is_none(), "one refused statement refuses the script");
         assert!(d.message().starts_with("statement 2 needs `sql_drop`"), "{}", d.message());
         assert_eq!(d.report()[1]["verdict"], "refused");
 
         h.allow(|_| true);
-        let p = prepare("SELECT 1; DROP TABLE public.t; SELECT 2", SCS, &ctx(), false).unwrap();
+        let p = prepare(Dialect::PostgreSql, "SELECT 1; DROP TABLE public.t; SELECT 2", SCS, &ctx(), false).unwrap();
         let (d, minted) = authorize(&*h, "db", "s", p, &Resolutions::new(), Mode::Script).unwrap();
         assert_eq!(minted.unwrap().len(), 3);
         assert!(d.capabilities().contains("sql_script") && d.capabilities().contains("sql_drop"));
@@ -663,7 +675,9 @@ mod tests {
     #[test]
     fn script_names_after_a_context_change_are_unaddressable() {
         let h = host();
-        let p = prepare("SELECT * FROM t; SET search_path = other; DROP TABLE t", SCS, &ctx(), false).unwrap();
+        let p =
+            prepare(Dialect::PostgreSql, "SELECT * FROM t; SET search_path = other; DROP TABLE t", SCS, &ctx(), false)
+                .unwrap();
         let mut res = Resolutions::new();
         for r in p.unresolved() {
             res.insert(r, Some("public".into()));
@@ -734,7 +748,7 @@ mod tests {
 
     #[test]
     fn a_reply_that_does_not_match_the_checks_refuses_everything() {
-        let p = prepare("UPDATE public.t SET a = 1 WHERE b = 2", SCS, &ctx(), true).unwrap();
+        let p = prepare(Dialect::PostgreSql, "UPDATE public.t SET a = 1 WHERE b = 2", SCS, &ctx(), true).unwrap();
         let e = authorize(&Liar, "db", "s", p, &Resolutions::new(), Mode::Execute).unwrap_err();
         assert_eq!(e.code, "internal");
         let edit = authorize_edit(

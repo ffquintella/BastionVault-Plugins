@@ -1,8 +1,12 @@
 //! `dbms-management`: the SQL browser's server half (features/sql-browser.md,
-//! S109, T125 Phase 3; scripts, exports and per-action step-up T126 Phase 5). A long-lived, multiplexed process plugin. Sessions
-//! hold a PostgreSQL connection opened with a login the host releases; every
+//! S109, T125 Phase 3; scripts, exports and per-action step-up T126 Phase 5;
+//! MySQL and MariaDB T127 Phase 6; SQL Server T128 Phase 7; Oracle T129
+//! Phase 8). A long-lived, multiplexed process plugin. Sessions hold a
+//! database connection opened with a login the host releases; every
 //! statement is classified (`bv-sql-classify`), authorized by the vault
-//! (`resource_sql_authorize`), executed through `driver::PgConn`, and audited.
+//! (`resource_sql_authorize`), executed through `driver::PgConn`,
+//! `mysql::conn::MyConn`, `mssql::conn::MsConn` or `oracle::conn::OraConn`,
+//! and audited.
 
 #![forbid(unsafe_code)]
 
@@ -11,12 +15,16 @@ pub mod audit;
 pub mod authz;
 pub mod config;
 pub mod driver;
+pub mod engine;
 pub mod export;
 pub mod host;
 pub mod ids;
 pub mod journal;
+pub mod mssql;
+pub mod mysql;
 pub mod netpolicy;
 pub mod objects;
+pub mod oracle;
 pub mod probe;
 pub mod profile;
 pub mod rows;
@@ -81,6 +89,10 @@ impl Plugin {
     /// A plugin whose verify modes trust `roots` when a profile has no CA
     /// bundle (tests inject their own).
     pub fn with_roots(roots: RootSource) -> Self {
+        // The MySQL driver builds its rustls config from the process default
+        // provider: make it `ring`, as everywhere else in this plugin. An
+        // already installed default (a second Plugin in tests) is kept.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .thread_name("dbms-worker")

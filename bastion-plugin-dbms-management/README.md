@@ -1,8 +1,16 @@
 # bastion-plugin-dbms-management
 
 The server half of BastionVault's SQL browser (`features/sql-browser.md` in the
-host repository, S109, T125 Phase 3): a long-lived, multiplexed process plugin
-(ABI 1.4) that holds PostgreSQL sessions on `database` resources. The operator
+host repository, S109, T125 Phase 3; MySQL and MariaDB T127 Phase 6; SQL
+Server T128 Phase 7; Oracle T129 Phase 8): a long-lived, multiplexed process
+plugin (ABI 1.4) that holds PostgreSQL, MySQL (8.0+), MariaDB (10.6+), SQL
+Server (2016+, tested on 2022) and Oracle Database (23ai and later, TCPS only,
+tested on Oracle AI Database 26ai Free) sessions on `database` resources.
+Oracle runs on the plugin's own session layer (`src/oracle/tns.rs`) over the
+Sans-I/O `oraclemcp-driver-cx-protocol` crate. MySQL and MariaDB profiles need TLS
+`require` or `verify-full`; SQL Server profiles need any mode but `disable`,
+and the server must present a configured X.509 v3 certificate (the one SQL
+Server generates for itself is v1, which webpki refuses). The operator
 never receives the database login; every statement is classified
 (`bv-sql-classify`), authorized by the vault (`resource_sql_authorize`), run
 through the plugin's one authorized-send path, and audited with the
@@ -40,8 +48,10 @@ Phase 5).
 - `cargo nextest run -p bastion-plugin-dbms-management` and
   `cargo test -p bastion-plugin-dbms-management --doc` (no database).
 - `make test-dbms` (host repository): live tests against throwaway
-  `postgres:16` containers through docker, plus the `openssl-sys` /
-  `aws-lc-sys` ban.
+  `postgres:16`, `mysql:8.4`, `mariadb:11.4` and
+  `mcr.microsoft.com/mssql/server:2022-latest` (linux/amd64) and
+  `gvenzl/oracle-free:23-full` containers through docker,
+  plus the `openssl-sys` / `aws-lc-sys` / `native-tls` ban.
 
 ## Known limits
 

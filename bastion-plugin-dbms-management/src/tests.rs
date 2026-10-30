@@ -45,11 +45,38 @@ fn refusals_before_release_never_ask_for_the_credential() {
     assert_eq!(code(&open(&p, &h, json!({"resource": "db"})).1), "no_sql_privilege");
     assert!(!h.called("resource_sql_credential"));
 
-    // Another engine.
+    // An engine this plugin does not serve.
     let mut t = target_json("database-first", &["sql_select"], vec![profile_json("ro", &["sql_select"])]);
-    t["target"]["engine"] = json!("mysql");
+    t["target"]["engine"] = json!("db2");
     let h = MockHost::new(t);
     assert_eq!(code(&open(&p, &h, json!({"resource": "db"})).1), "unsupported");
+    assert!(!h.called("resource_sql_credential"));
+
+    // MySQL / MariaDB without TLS, or with verify-ca: refused before the
+    // login is released (T127).
+    for (engine, mode, want) in [
+        ("mysql", "disable", "tls_required"),
+        ("mariadb", "disable", "tls_required"),
+        ("mysql", "verify-ca", "tls_mode_unsupported"),
+        // SQL Server: SQL authentication's password is only obfuscated (T128).
+        ("mssql", "disable", "tls_required"),
+        // Oracle: TCPS only; O5LOGON in the clear invites offline attack (T129).
+        ("oracle", "disable", "tls_required"),
+    ] {
+        let mut prof = profile_json("ro", &["sql_select"]);
+        prof["tls"]["mode"] = json!(mode);
+        let mut t = target_json("database-first", &["sql_select"], vec![prof]);
+        t["target"]["engine"] = json!(engine);
+        let h = MockHost::new(t);
+        assert_eq!(code(&open(&p, &h, json!({"resource": "db"})).1), want, "{engine} {mode}");
+        assert!(!h.called("resource_sql_credential"));
+    }
+
+    // A named instance on another engine.
+    let mut prof = profile_json("ro", &["sql_select"]);
+    prof["instance"] = json!("SQLEXPRESS");
+    let h = MockHost::new(target_json("database-first", &["sql_select"], vec![prof]));
+    assert_eq!(code(&open(&p, &h, json!({"resource": "db"})).1), "invalid_profile");
     assert!(!h.called("resource_sql_credential"));
 
     // A read-only grant on a resource with only an admin login.

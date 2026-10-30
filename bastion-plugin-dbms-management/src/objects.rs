@@ -10,7 +10,8 @@ use bv_sql_guard::sql;
 use serde_json::{json, Value};
 
 use crate::api::ApiError;
-use crate::driver::{DbError, PluginSql, TextParam};
+use crate::driver::{DbError, PgConn, PluginSql, TextParam};
+use crate::engine::DbConn;
 use crate::host::{verdicts_match, Check};
 use crate::session::{Ctx, Session};
 
@@ -26,7 +27,7 @@ fn text(s: &str) -> TextParam {
 }
 
 /// Ask the host; `Ok(verdict per check)`, refusing a malformed reply.
-fn decide(cx: &Ctx<'_>, s: &Session, checks: &[Check]) -> Result<Vec<bool>, ApiError> {
+pub(crate) fn decide(cx: &Ctx<'_>, s: &Session, checks: &[Check]) -> Result<Vec<bool>, ApiError> {
     let mut out = Vec::with_capacity(checks.len());
     for chunk in checks.chunks(crate::authz::MAX_CHECKS) {
         let v = cx.host.sql_authorize(&s.resource, chunk)?;
@@ -38,7 +39,7 @@ fn decide(cx: &Ctx<'_>, s: &Session, checks: &[Check]) -> Result<Vec<bool>, ApiE
     Ok(out)
 }
 
-fn require(cx: &Ctx<'_>, s: &Session, check: Check) -> Result<(), ApiError> {
+pub(crate) fn require(cx: &Ctx<'_>, s: &Session, check: Check) -> Result<(), ApiError> {
     if decide(cx, s, std::slice::from_ref(&check))?.first() == Some(&true) {
         Ok(())
     } else {
@@ -48,18 +49,51 @@ fn require(cx: &Ctx<'_>, s: &Session, check: Check) -> Result<(), ApiError> {
 
 /// The session's database, as object paths name it.
 pub fn catalog(s: &Session) -> String {
-    s.catalog.clone()
+    match s.conn() {
+        DbConn::Pg(_) => s.catalog.clone(),
+        // MySQL / MariaDB paths name the catalog `def` (§3.2).
+        DbConn::My(_) => bv_sql_classify::MYSQL_CATALOG.to_string(),
+        // SQL Server paths name the database as the classifier folds it.
+        DbConn::Ms(_) => match s.lexer() {
+            bv_sql_classify::LexerSettings::MsSql { catalogs, .. } => {
+                crate::mssql::conn::canon(catalogs, &s.current_catalog()).unwrap_or_default()
+            }
+            _ => String::new(),
+        },
+        // Oracle paths name the service in upper case (§3.2).
+        DbConn::Ora(_) => s.current_catalog(),
+    }
+}
+
+/// The PostgreSQL connection; MySQL / MariaDB sessions are dispatched to
+/// `mysql::browse` before any caller of this is reached.
+fn pg(s: &Session) -> Result<&Arc<PgConn>, ApiError> {
+    match s.conn() {
+        DbConn::Pg(c) => Ok(c),
+        DbConn::My(_) => Err(ApiError::internal("a MySQL session reached the PostgreSQL browser")),
+        DbConn::Ms(_) => Err(ApiError::internal("a SQL Server session reached the PostgreSQL browser")),
+        DbConn::Ora(_) => Err(ApiError::internal("an Oracle session reached the PostgreSQL browser")),
+    }
 }
 
 /// `LIST v2/sessions/<id>/objects`: the schemas the login can use.
 pub fn schemas(cx: &Ctx<'_>, s: &Arc<Session>) -> Result<Value, ApiError> {
+    if let DbConn::My(c) = s.conn() {
+        return crate::mysql::browse::schemas(cx, s, c);
+    }
+    if let DbConn::Ms(c) = s.conn() {
+        return crate::mssql::browse::schemas(cx, s, c);
+    }
+    if let DbConn::Ora(c) = s.conn() {
+        return crate::oracle::browse::schemas(cx, s, c);
+    }
     require(cx, s, Check::server("sql_select"))?;
     let q = PluginSql::guarded(sql!(
         "SELECT n.nspname::text FROM pg_catalog.pg_namespace n \
          WHERE n.nspname OPERATOR(pg_catalog.!~) '^pg_toast' AND n.nspname OPERATOR(pg_catalog.!~) '^pg_temp_' \
          AND pg_catalog.has_schema_privilege(n.oid, 'USAGE') ORDER BY 1"
     ));
-    let rows = cx.rt.block_on(s.conn().internal_query(&q, &[])).map_err(db)?;
+    let rows = cx.rt.block_on(pg(s)?.internal_query(&q, &[])).map_err(db)?;
     let names: Vec<String> = rows.iter().filter_map(|r| r.try_get::<_, String>(0).ok()).collect();
     Ok(json!({"catalog": catalog(s), "keys": names}))
 }
@@ -79,6 +113,15 @@ fn relkind(k: &str) -> &'static str {
 /// `LIST v2/sessions/<id>/objects/<schema>`: relations, sequences, indexes
 /// and routines in a schema, filtered by the caller's grants.
 pub fn list(cx: &Ctx<'_>, s: &Arc<Session>, schema: &str) -> Result<Value, ApiError> {
+    if let DbConn::My(c) = s.conn() {
+        return crate::mysql::browse::list(cx, s, c, schema);
+    }
+    if let DbConn::Ms(c) = s.conn() {
+        return crate::mssql::browse::list(cx, s, c, schema);
+    }
+    if let DbConn::Ora(c) = s.conn() {
+        return crate::oracle::browse::list(cx, s, c, schema);
+    }
     let cat = catalog(s);
     let q = PluginSql::guarded(sql!(
         "SELECT name, kind FROM ( \
@@ -90,7 +133,7 @@ pub fn list(cx: &Ctx<'_>, s: &Arc<Session>, schema: &str) -> Result<Value, ApiEr
              JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace WHERE n.nspname OPERATOR(pg_catalog.=) $1::text \
          ) o ORDER BY name, kind LIMIT 2001"
     ));
-    let rows = cx.rt.block_on(s.conn().internal_query(&q, &[text(schema)])).map_err(db)?;
+    let rows = cx.rt.block_on(pg(s)?.internal_query(&q, &[text(schema)])).map_err(db)?;
     let mut objects: Vec<(String, String)> =
         rows.iter().filter_map(|r| Some((r.try_get::<_, String>(0).ok()?, r.try_get::<_, String>(1).ok()?))).collect();
     let truncated = objects.len() as i64 > MAX_LISTED;
@@ -117,7 +160,7 @@ pub fn list(cx: &Ctx<'_>, s: &Arc<Session>, schema: &str) -> Result<Value, ApiEr
 
 /// The key a grid edit addresses: the primary key, else the first unique
 /// constraint whose columns are all NOT NULL (§7).
-pub async fn edit_key(s: &Session, schema: &str, table: &str) -> Result<Option<Vec<String>>, DbError> {
+pub async fn edit_key(conn: &PgConn, schema: &str, table: &str) -> Result<Option<Vec<String>>, DbError> {
     let q = PluginSql::guarded(sql!(
         "SELECT con.contype::text, \
            ARRAY(SELECT a.attname::text FROM pg_catalog.unnest(con.conkey) WITH ORDINALITY k(att, ord) \
@@ -129,7 +172,7 @@ pub async fn edit_key(s: &Session, schema: &str, table: &str) -> Result<Option<V
          WHERE n.nspname OPERATOR(pg_catalog.=) $1::text AND c.relname OPERATOR(pg_catalog.=) $2::text AND c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r','p']::pg_catalog.\"char\"[]) AND con.contype OPERATOR(pg_catalog.=) ANY (ARRAY['p','u']::pg_catalog.\"char\"[]) \
          ORDER BY con.contype, con.conname"
     ));
-    let rows = s.conn().internal_query(&q, &[text(schema), text(table)]).await?;
+    let rows = conn.internal_query(&q, &[text(schema), text(table)]).await?;
     for r in &rows {
         let kind: String = r.try_get(0).map_err(DbError::from)?;
         let cols: Vec<String> = r.try_get(1).map_err(DbError::from)?;
@@ -144,6 +187,15 @@ pub async fn edit_key(s: &Session, schema: &str, table: &str) -> Result<Option<V
 /// `READ v2/sessions/<id>/objects/<schema>/<object>`: columns, keys,
 /// indexes, triggers and the definition text where the login can read it.
 pub fn describe(cx: &Ctx<'_>, s: &Arc<Session>, schema: &str, name: &str) -> Result<Value, ApiError> {
+    if let DbConn::My(c) = s.conn() {
+        return crate::mysql::browse::describe(cx, s, c, schema, name);
+    }
+    if let DbConn::Ms(c) = s.conn() {
+        return crate::mssql::browse::describe(cx, s, c, schema, name);
+    }
+    if let DbConn::Ora(c) = s.conn() {
+        return crate::oracle::browse::describe(cx, s, c, schema, name);
+    }
     let cat = catalog(s);
     require(cx, s, Check::object("sql_select", &cat, schema, name))?;
     let p = [text(schema), text(name)];
@@ -184,7 +236,7 @@ pub fn describe(cx: &Ctx<'_>, s: &Arc<Session>, schema: &str, name: &str) -> Res
          FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace \
          WHERE n.nspname OPERATOR(pg_catalog.=) $1::text AND p.proname OPERATOR(pg_catalog.=) $2::text ORDER BY p.oid"
     ));
-    let conn = s.conn().clone();
+    let conn = pg(s)?.clone();
     let (rel, cols, cons, idx, trg, fun, key) = cx
         .rt
         .block_on(async {
@@ -195,7 +247,7 @@ pub fn describe(cx: &Ctx<'_>, s: &Arc<Session>, schema: &str, name: &str) -> Res
                 conn.internal_query(&idx, &p).await?,
                 conn.internal_query(&trg, &p).await?,
                 conn.internal_query(&fun, &p).await?,
-                edit_key(s, schema, name).await?,
+                edit_key(&conn, schema, name).await?,
             ))
         })
         .map_err(db)?;

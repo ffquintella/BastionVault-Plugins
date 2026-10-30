@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bv_sql_classify::{redact, Dialect, LexerSettings, NameContext, ObjectKind, ObjectRef, StatementKind};
+use bv_sql_classify::{redact, LexerSettings, NameContext, ObjectKind, ObjectRef, StatementKind};
 use bv_sql_guard::sql;
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
@@ -17,10 +17,14 @@ use crate::audit::{self, Outbox, Pending};
 use crate::authz::{self, Mode, Resolutions};
 use crate::config::Config;
 use crate::driver::{ConnectSpec, DbError, PgConn, PluginSql, TextParam};
+use crate::engine::{DbConn, Engine};
 use crate::export::{self, ExportJob, ExportLimits, ExportOptions, Format, InsertTarget};
 use crate::host::Host;
 use crate::ids;
 use crate::journal::{self, Record};
+use crate::mssql::conn::MsConn;
+use crate::mysql::conn::MyConn;
+use crate::oracle::conn::OraConn;
 use crate::profile::{self, Enforcement, Selection, Target, TlsMode};
 use crate::run::{self, Run, RunLimits, RunStatus, ScriptInfo, StatementResult};
 use crate::tls::RootSource;
@@ -29,6 +33,7 @@ use crate::wire::TxStatus;
 /// What the session's profile and connection established.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
+    pub engine: Engine,
     pub server_version: String,
     pub enforcement: Enforcement,
     pub read_only: bool,
@@ -78,7 +83,7 @@ pub struct Session {
     pub info: SessionInfo,
     pub opened: Instant,
     pub opened_ms: u64,
-    conn: Arc<PgConn>,
+    conn: DbConn,
     state: Mutex<State>,
 }
 
@@ -87,8 +92,18 @@ impl Session {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    pub fn conn(&self) -> &Arc<PgConn> {
+    pub fn conn(&self) -> &DbConn {
         &self.conn
+    }
+
+    /// The lexer settings the session classifies with.
+    pub fn lexer(&self) -> LexerSettings {
+        self.lock().lexer
+    }
+
+    /// The database the session is in now, as the server names it.
+    pub fn current_catalog(&self) -> String {
+        self.lock().ctx.current_catalog.clone()
     }
 
     fn event(&self, name: &str) -> Value {
@@ -97,13 +112,13 @@ impl Session {
 
     pub fn status(&self) -> Value {
         let st = self.lock();
-        let tx = self.conn.wire().tx();
+        let tx = self.conn.tx();
         json!({
             "session_id": self.id,
             "resource": self.resource,
             "profile": self.profile,
             "catalog": self.catalog,
-            "engine": "postgresql",
+            "engine": self.info.engine.as_str(),
             "server_version": self.info.server_version,
             "enforcement": self.info.enforcement.as_str(),
             "db_enforced": self.info.db_enforced,
@@ -125,11 +140,12 @@ impl Session {
             "active_run": st.active.as_ref().filter(|r| r.status() == RunStatus::Running).map(|r| r.id.clone()),
             "active_export": st.exports.values().find(|j| j.is_running()).map(|j| j.id.clone()),
             "step_up": profile::canonical_action(&self.info.step_up).split(',').filter(|a| !a.is_empty()).collect::<Vec<_>>(),
+            "residuals": residuals(self.info.engine),
             "idle_secs": st.last_used.elapsed().as_secs(),
             "age_secs": self.opened.elapsed().as_secs(),
             "rows_read": st.rows_read,
             "closed": st.closed,
-            "taint": self.conn.wire().taint(),
+            "taint": self.conn.taint(),
         })
     }
 
@@ -292,6 +308,30 @@ impl Registry {
     }
 }
 
+/// What this engine's session cannot enforce at the protocol or database
+/// level, stated in the enforcement panel (§4.3, §5.3).
+pub fn residuals(engine: Engine) -> Vec<&'static str> {
+    match engine {
+        Engine::MsSql => vec![
+            "SQL Server runs each statement as a T-SQL batch, and the protocol cannot limit a batch to one \
+             statement: the classifier refuses any statement it reads as two, and the login's ceiling bounds \
+             what it cannot see",
+            "SQL Server has no read-only session guard: for a read-only grant, only a read-only login keeps the \
+             database from writing",
+        ],
+        Engine::Oracle => vec![
+            "Oracle has no session-wide read-only mode: a read-only session runs each statement in the plugin's \
+             own SET TRANSACTION READ ONLY, which autonomous transactions (PRAGMA AUTONOMOUS_TRANSACTION) escape, \
+             so for a read-only grant only a read-only login keeps the database from writing",
+            "Oracle has no server auto-commit: outside an explicit transaction the plugin commits after every \
+             statement (rolls back after a failed one), and DDL commits an open transaction implicitly",
+            "a cancel is an in-band break on the session's TLS connection, which the server notices when it polls: \
+             a busy statement stops, one waiting (a sleep, a lock) only when its wait ends",
+        ],
+        _ => Vec::new(),
+    }
+}
+
 /// Everything an operation needs from the plugin.
 pub struct Ctx<'a> {
     pub rt: &'a Runtime,
@@ -339,14 +379,30 @@ fn open_reserved(
     ticket: Option<&str>,
 ) -> Result<Value, ApiError> {
     let target = Target::parse(&cx.host.sql_target(resource)?)?;
-    if target.engine != "postgresql" {
+    let Some(engine) = Engine::parse(&target.engine) else {
         return Err(ApiError::unsupported(format!(
-            "engine `{}` is not supported by this plugin version (PostgreSQL only; T127-T129)",
+            "engine `{}` is not supported by this plugin version (PostgreSQL, MySQL, MariaDB, SQL Server and Oracle)",
             target.engine
         )));
-    }
+    };
     let selection: Selection = profile::select(&target, requested)?;
     let p = &selection.profile;
+    // Refused before the login is released or an MFA ticket is spent.
+    match engine {
+        Engine::PostgreSql => {}
+        Engine::MySql | Engine::MariaDb => {
+            crate::mysql::conn::check_tls_mode(p.tls.mode).map_err(|e| ApiError::refused(e.code, e.message))?
+        }
+        Engine::MsSql => {
+            crate::mssql::conn::check_tls_mode(p.tls.mode).map_err(|e| ApiError::refused(e.code, e.message))?
+        }
+        Engine::Oracle => {
+            crate::oracle::conn::check_tls_mode(p.tls.mode).map_err(|e| ApiError::refused(e.code, e.message))?
+        }
+    }
+    if p.instance.is_some() && engine != Engine::MsSql {
+        return Err(ApiError::refused("invalid_profile", "`instance` names a SQL Server named instance"));
+    }
     if p.require_mfa {
         let ticket =
             ticket.ok_or_else(|| ApiError::refused("mfa_required", "this SQL profile requires an MFA ticket"))?;
@@ -373,16 +429,47 @@ fn open_reserved(
         denied: &cx.cfg.denied(),
         roots: cx.roots,
     };
-    let conn = cx.rt.block_on(PgConn::connect(spec, credential)).map_err(|e| {
+    let refused = |e: crate::driver::ConnectError| {
         let mut ev = audit::base("dbms.session.open", &id, &target.resource, &p.id, selection.db_enforced);
         ev["outcome"] = json!("failed");
         ev["reason"] = json!(e.code);
         let _ = cx.host.audit(ev);
         ApiError::refused(e.code, e.message)
-    })?;
-    let conn = Arc::new(conn);
-
-    let setup = cx.rt.block_on(establish(&conn, selection.read_only));
+    };
+    let statement_timeout = spec.statement_timeout;
+    let (conn, setup) = match engine {
+        Engine::PostgreSql => {
+            let conn = Arc::new(cx.rt.block_on(PgConn::connect(spec, credential)).map_err(refused)?);
+            let setup = cx.rt.block_on(establish(&conn, selection.read_only));
+            (DbConn::Pg(conn), setup)
+        }
+        Engine::MySql | Engine::MariaDb => {
+            let conn = Arc::new(cx.rt.block_on(MyConn::connect(spec, credential)).map_err(refused)?);
+            let setup = cx
+                .rt
+                .block_on(conn.establish(engine == Engine::MariaDb, selection.read_only, statement_timeout))
+                .map(|e| (e.lexer, e.ctx, e.database_read_only, e.server_version));
+            (DbConn::My(conn), setup)
+        }
+        Engine::MsSql => {
+            let instance = p.instance.as_deref();
+            let conn = Arc::new(cx.rt.block_on(MsConn::connect(spec, credential, instance)).map_err(refused)?);
+            // SQL Server has no read-only session guard (§5.3): the ceiling
+            // is the only database-side control.
+            let setup = cx.rt.block_on(conn.establish(instance)).map(|e| (e.lexer, e.ctx, false, e.server_version));
+            (DbConn::Ms(conn), setup)
+        }
+        Engine::Oracle => {
+            let conn = Arc::new(cx.rt.block_on(OraConn::connect(spec, credential)).map_err(refused)?);
+            // Not database-enforced even under the read-only guard (§5.3):
+            // autonomous transactions escape SET TRANSACTION READ ONLY.
+            let setup = cx.rt.block_on(async {
+                let version = conn.server_version().await;
+                conn.establish(version).await
+            });
+            (DbConn::Ora(conn), setup.map(|e| (e.lexer, e.ctx, false, e.server_version)))
+        }
+    };
     let (lexer, ctx, database_read_only, server_version) = match setup {
         Ok(v) => v,
         Err(e) => {
@@ -392,6 +479,7 @@ fn open_reserved(
     };
     let opened_ms = journal::now_ms();
     let info = SessionInfo {
+        engine,
         server_version,
         enforcement: target.enforcement,
         read_only: selection.read_only,
@@ -437,7 +525,7 @@ fn open_reserved(
     });
     let mut ev = session.event("dbms.session.open");
     ev["outcome"] = json!("opened");
-    ev["engine"] = json!("postgresql");
+    ev["engine"] = json!(engine.as_str());
     ev["server_version"] = json!(session.info.server_version);
     ev["enforcement"] = json!(session.info.enforcement.as_str());
     ev["read_only"] = json!(session.info.read_only);
@@ -557,14 +645,14 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
     }
     let ticket = text_field(data, "step_up_ticket", 256)?;
     s.touch();
-    if let Some(why) = s.conn.wire().taint() {
+    if let Some(why) = s.conn.taint() {
         close(cx, s, "tainted");
         return Err(ApiError::refused("session_tainted", format!("{why}; the session was closed")));
     }
     let _op = s.begin_op()?;
     let (lexer, mut ctx, mut stale) = s.classify_inputs()?;
     if stale {
-        if let Ok(fresh) = cx.rt.block_on(read_context(&s.conn, s.info.database_read_only)) {
+        if let Ok(fresh) = cx.rt.block_on(s.conn.read_context(s.info.database_read_only)) {
             let mut st = s.lock();
             st.ctx = fresh.clone();
             st.ctx_stale = false;
@@ -573,7 +661,7 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
         }
     }
     let digest = ids::digest(cx.digest_key, "statement", text.as_bytes());
-    let prepared = match authz::prepare(text, lexer, &ctx, true) {
+    let prepared = match authz::prepare(s.info.engine.dialect(), text, lexer, &ctx, true) {
         Ok(p) => p,
         Err(r) => {
             let mut ev = s.event("dbms.statement");
@@ -595,7 +683,7 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
         Resolutions::new()
     } else {
         cx.rt
-            .block_on(resolve(&s.conn, &refs))
+            .block_on(s.conn.resolve(&refs))
             .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
     };
     let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Execute)?;
@@ -639,7 +727,7 @@ fn start_execute(
     digest: String,
 ) -> Result<Value, ApiError> {
     let journal_text = {
-        let redacted = redact(Dialect::PostgreSql, lexer, text).ok();
+        let redacted = redact(s.info.engine.dialect(), lexer, text).ok();
         journal::text_for(&cx.cfg.journal_text, text, redacted)
     };
     let (run, budget_left) = {
@@ -772,19 +860,19 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
     if single && !stop_on_error {
         return Err(ApiError::bad_request(
             "`on_error: continue` cannot run inside `transaction: single`: on PostgreSQL an error aborts the \
-             transaction, so nothing after it could run",
+             transaction, so nothing after it could run (the rule holds for every engine)",
         ));
     }
     let ticket = text_field(data, "step_up_ticket", 256)?;
     s.touch();
-    if let Some(why) = s.conn.wire().taint() {
+    if let Some(why) = s.conn.taint() {
         close(cx, s, "tainted");
         return Err(ApiError::refused("session_tainted", format!("{why}; the session was closed")));
     }
     let _op = s.begin_op()?;
     let (lexer, mut ctx, mut stale) = s.classify_inputs()?;
     if stale {
-        if let Ok(fresh) = cx.rt.block_on(read_context(&s.conn, s.info.database_read_only)) {
+        if let Ok(fresh) = cx.rt.block_on(s.conn.read_context(s.info.database_read_only)) {
             let mut st = s.lock();
             st.ctx = fresh.clone();
             st.ctx_stale = false;
@@ -804,7 +892,7 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         ev["statements"] = json!(count);
         let _ = cx.host.audit(ev);
     };
-    let prepared = match authz::prepare(text, lexer, &ctx, false) {
+    let prepared = match authz::prepare(s.info.engine.dialect(), text, lexer, &ctx, false) {
         Ok(p) => p,
         Err(r) => {
             refuse(script_ev, r.code, r.statement, None);
@@ -835,7 +923,7 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
                  and ends the transaction",
             ));
         }
-        if s.conn.wire().tx() != TxStatus::Idle {
+        if s.conn.tx() != TxStatus::Idle {
             refuse(script_ev, "transaction_open", None, Some(count));
             return Err(ApiError::refused(
                 "transaction_open",
@@ -848,7 +936,7 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         Resolutions::new()
     } else {
         cx.rt
-            .block_on(resolve(&s.conn, &refs))
+            .block_on(s.conn.resolve(&refs))
             .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
     };
     let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Script)?;
@@ -864,7 +952,7 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         reply["request"] = json!(decision.request_report());
         return Ok(reply);
     }
-    let engine = "postgresql";
+    let engine = s.info.engine.as_str();
     let mut warnings = Vec::new();
     if single && commits_ddl_implicitly(engine) {
         warnings.push(format!(
@@ -894,7 +982,7 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         let run = Run::with_script(run_id.clone(), limits, Some(info));
         for a in &stmts {
             let m = a.meta();
-            let redacted = redact(Dialect::PostgreSql, lexer, a.text()).ok();
+            let redacted = redact(s.info.engine.dialect(), lexer, a.text()).ok();
             st.journal.push(json!({
                 "run": run_id, "index": m.index, "at_ms": journal::now_ms(), "kinds": [m.kind_name()],
                 "required": m.required_json(), "unclassified": m.unclassified, "script": digest,
@@ -924,12 +1012,7 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
 /// A script run: with `transaction: single`, the plugin's own `BEGIN`
 /// before the first statement and `COMMIT` (every statement succeeded) or
 /// `ROLLBACK` (anything else) after the last, before the run reads as ended.
-async fn run_script(
-    conn: Arc<PgConn>,
-    run: Arc<Run>,
-    stmts: Vec<authz::AuthorizedStatement>,
-    single: bool,
-) -> run::RunEnd {
+async fn run_script(conn: DbConn, run: Arc<Run>, stmts: Vec<authz::AuthorizedStatement>, single: bool) -> run::RunEnd {
     if !single {
         return run::produce(conn, run, stmts).await;
     }
@@ -1003,6 +1086,12 @@ pub fn export(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         return Err(ApiError::bad_request("`formula_guard` applies to csv only"));
     }
     let target = match (format, data.get("table")) {
+        (Format::SqlInsert, _) if s.info.engine != Engine::PostgreSql => {
+            return Err(ApiError::unsupported(
+                "sql-insert exports are PostgreSQL-only in this version; export csv or jsonl from MySQL, MariaDB, \
+                 SQL Server and Oracle",
+            ))
+        }
         (Format::SqlInsert, Some(t)) if !t.is_null() => Some(InsertTarget::parse(t)?),
         (Format::SqlInsert, _) => {
             return Err(ApiError::bad_request("a sql-insert export needs `table` {schema?, name}"))
@@ -1012,12 +1101,12 @@ pub fn export(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
     };
     let ticket = text_field(data, "step_up_ticket", 256)?;
     s.touch();
-    if let Some(why) = s.conn.wire().taint() {
+    if let Some(why) = s.conn.taint() {
         close(cx, s, "tainted");
         return Err(ApiError::refused("session_tainted", format!("{why}; the session was closed")));
     }
     let _op = s.begin_op()?;
-    if s.conn.wire().tx() == TxStatus::Failed {
+    if s.conn.tx() == TxStatus::Failed {
         return Err(ApiError::refused("transaction_aborted", "the open transaction failed; roll it back first"));
     }
     let (lexer, ctx, stale) = s.classify_inputs()?;
@@ -1036,7 +1125,7 @@ pub fn export(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         ev["reason"] = json!(code);
         let _ = cx.host.audit(ev);
     };
-    let prepared = match authz::prepare(text, lexer, &ctx, true) {
+    let prepared = match authz::prepare(s.info.engine.dialect(), text, lexer, &ctx, true) {
         Ok(p) => p,
         Err(r) => {
             refused(ev, r.code);
@@ -1052,7 +1141,7 @@ pub fn export(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         Resolutions::new()
     } else {
         cx.rt
-            .block_on(resolve(&s.conn, &refs))
+            .block_on(s.conn.resolve(&refs))
             .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
     };
     let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Export)?;
@@ -1074,7 +1163,7 @@ pub fn export(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
         let id = format!("e{}", st.export_seq);
         let job = ExportJob::new(id, format, digest.clone(), limits);
         let meta = stmt.meta();
-        let redacted = redact(Dialect::PostgreSql, lexer, text).ok();
+        let redacted = redact(s.info.engine.dialect(), lexer, text).ok();
         st.journal.push(json!({
             "export": job.id, "index": 0, "at_ms": journal::now_ms(), "kinds": [meta.kind_name()],
             "required": meta.required_json(), "digest": digest, "format": format.as_str(),
@@ -1172,8 +1261,7 @@ pub fn export_cancel(cx: &Ctx<'_>, s: &Arc<Session>, job: &str) -> Result<Value,
 /// Book-keeping once a run ends: rows read, transaction state, and the name
 /// context after a statement that may have changed it.
 async fn after_run(s: &Arc<Session>, end: run::RunEnd) {
-    let refreshed =
-        if end.context_changed { Some(read_context(&s.conn, s.info.database_read_only).await) } else { None };
+    let refreshed = if end.context_changed { Some(s.conn.read_context(s.info.database_read_only).await) } else { None };
     let mut st = s.lock();
     st.rows_read += end.rows_read;
     match refreshed {
@@ -1209,7 +1297,7 @@ fn report(cx_host: Option<&dyn Host>, outbox: &Outbox, s: &Session, run: &Run) -
                 "duration_ms": r.duration_ms, "error": r.error.as_ref().map(DbError::redacted), "truncated": r.truncated}),
         );
         if r.meta.tx_control {
-            let tx = s.conn.wire().tx();
+            let tx = s.conn.tx();
             match r.meta.kind {
                 Some(StatementKind::TxBegin) => {
                     st.tx_since = Some(Instant::now());
@@ -1320,7 +1408,7 @@ pub async fn close_async(reg: &Registry, s: &Arc<Session>, reason: &str) {
             let _ = tokio::time::timeout(Duration::from_secs(3), s.conn.cancel()).await;
         }
     }
-    if matches!(s.conn.wire().tx(), TxStatus::InTransaction | TxStatus::Failed) && !s.conn.is_closed() {
+    if matches!(s.conn.tx(), TxStatus::InTransaction | TxStatus::Failed) && !s.conn.is_closed() {
         let rollback = PluginSql::guarded(sql!("ROLLBACK"));
         let rolled = tokio::time::timeout(Duration::from_secs(5), s.conn.internal_execute(&rollback)).await;
         let mut ev = s.event("dbms.tx");
@@ -1371,7 +1459,7 @@ pub async fn sweep(reg: &Registry, cfg: &Config) {
             close_async(reg, &s, r).await;
             continue;
         }
-        let in_tx = matches!(s.conn.wire().tx(), TxStatus::InTransaction | TxStatus::Failed);
+        let in_tx = matches!(s.conn.tx(), TxStatus::InTransaction | TxStatus::Failed);
         if in_tx && !busy && tx_idle >= Duration::from_secs(cfg.idle_tx_secs) {
             let rollback = PluginSql::guarded(sql!("ROLLBACK"));
             let rolled = tokio::time::timeout(Duration::from_secs(5), s.conn.internal_execute(&rollback)).await;
