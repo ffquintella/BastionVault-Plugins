@@ -219,6 +219,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -228,7 +234,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "bastion-plugin-dbms-management"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bastion-plugin-sdk",
  "bastion-plugin-testkit",
  "bv-sql-classify",
@@ -258,7 +264,7 @@ dependencies = [
 name = "bastion-plugin-email"
 version = "0.1.1"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "lettre",
  "reqwest",
  "serde",
@@ -270,7 +276,7 @@ dependencies = [
 name = "bastion-plugin-pmp"
 version = "0.1.2"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "calamine",
  "serde",
  "serde_json",
@@ -281,7 +287,7 @@ dependencies = [
 name = "bastion-plugin-sdk"
 version = "0.41.5"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bv_plugin_surface",
  "serde",
  "serde_json",
@@ -308,7 +314,7 @@ dependencies = [
 name = "bastion-plugin-testkit"
 version = "0.41.5"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
@@ -331,7 +337,7 @@ dependencies = [
 name = "bastion-plugin-webhook-notify"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bastion-plugin-sdk",
  "serde",
  "serde_json",
@@ -343,7 +349,7 @@ name = "bastion-plugin-xca"
 version = "0.1.22"
 dependencies = [
  "aes 0.9.0",
- "base64",
+ "base64 0.22.1",
  "cbc 0.2.0",
  "des 0.9.0",
  "hex",
@@ -1171,7 +1177,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9298e6504d9b9e780ed3f7dfd43a61be8cd0e09eb07f7706a945b0072b6670b6"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "memchr",
 ]
 
@@ -1692,7 +1698,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -1995,7 +2001,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "email-encoding",
  "email_address",
  "fastrand",
@@ -2206,7 +2212,7 @@ version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f27695f286b461da077b8c2f72f47feaa04ce3c3f9c0976257410e90e21208a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bitflags",
  "btoi",
  "byteorder",
@@ -2446,7 +2452,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -2534,7 +2540,7 @@ version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08808e3c483c46e999108051c78334f473d5adb59d78bb80a1268c7e6aa6c514"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "byteorder",
  "bytes",
  "fallible-iterator 0.2.0",
@@ -2873,7 +2879,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "http",
@@ -3368,9 +3374,9 @@ dependencies = [
 
 [[package]]
 name = "sqlparser"
-version = "0.63.0"
+version = "0.64.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3679862809bd1f92e563cf6fd820e28f39135303668001c10331d5027183e8b4"
+checksum = "92e0d273b4f8ddd14a35ed36862acbc9cc96cec578e36ee1881a9d42e0e0f2c8"
 dependencies = [
  "log",
  "sqlparser_derive",
@@ -3378,9 +3384,9 @@ dependencies = [
 
 [[package]]
 name = "sqlparser_derive"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2905ae8e8148d8f7f5748ea95d1e949fa4fc1d7f5161547b758ad118b2e4b0aa"
+checksum = "5fa4939c717eaef717f244768d35a5f93c62e1d440865097d2edef7d86ddb7e0"
 dependencies = [
  "proc-macro2",
  "quote",
