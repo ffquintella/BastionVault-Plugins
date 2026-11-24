@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "bastion-plugin-sdk"
-version = "0.41.5"
+version = "0.41.6"
 dependencies = [
  "base64 0.23.1",
  "bv_plugin_surface",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "bastion-plugin-testkit"
-version = "0.41.5"
+version = "0.41.6"
 dependencies = [
  "base64 0.23.1",
  "serde_json",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "bv-sql-classify"
-version = "0.41.2"
+version = "0.41.3"
 dependencies = [
  "sqlparser",
 ]
