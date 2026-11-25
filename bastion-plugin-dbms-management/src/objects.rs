@@ -30,7 +30,7 @@ fn text(s: &str) -> TextParam {
 pub(crate) fn decide(cx: &Ctx<'_>, s: &Session, checks: &[Check]) -> Result<Vec<bool>, ApiError> {
     let mut out = Vec::with_capacity(checks.len());
     for chunk in checks.chunks(crate::authz::MAX_CHECKS) {
-        let v = cx.host.sql_authorize(&s.resource, chunk)?;
+        let v = crate::host::Host::sql_authorize(&s.clamp(cx.host), &s.resource, chunk)?;
         if !verdicts_match(chunk, &v) {
             return Err(ApiError::internal("the host's verdicts do not match the checks; refused"));
         }

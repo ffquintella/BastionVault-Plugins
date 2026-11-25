@@ -265,22 +265,32 @@ pub struct Selection {
     pub vault_only: Vec<&'static str>,
     /// Every capability the caller holds is also all the login can do.
     pub db_enforced: bool,
+    /// Capabilities the caller holds that the chosen login's ceiling does not
+    /// reach: the session is clamped to refuse them (never silently
+    /// widened), and the GUI shows them.
+    pub narrowed_out: Vec<&'static str>,
 }
 
 /// §5.2: the smallest stored-secret profile whose ceiling covers the
 /// caller's statement capabilities; a read-only grant is served only by an
 /// exactly read-only login under `database-first`. `requested` narrows the
 /// choice to one profile, which must itself qualify.
+///
+/// When no profile covers the whole grant, the session is *narrowed* to the
+/// profile whose ceiling reaches the most of it (smallest ceiling on a tie):
+/// the session's capabilities are the grant intersected with that ceiling,
+/// the rest is listed in `narrowed_out` and refused by the session, and the
+/// caller is never given more than the login can do. A profile that reaches
+/// none of the grant never serves.
 pub fn select(target: &Target, requested: Option<&str>) -> Result<Selection, ApiError> {
-    let grant: BTreeSet<&'static str> =
+    let full: BTreeSet<&'static str> =
         target.server_caps.iter().copied().filter(|c| STATEMENT_CAPS.contains(c)).collect();
-    if grant.is_empty() {
+    if full.is_empty() {
         return Err(ApiError::refused(
             "no_sql_privilege",
             "the caller holds no statement capability (sql_select … sql_admin) on this resource's sql/server",
         ));
     }
-    let read_only = grant.len() == 1 && grant.contains("sql_select");
     let candidates: Vec<&Profile> = target
         .profiles
         .iter()
@@ -295,30 +305,60 @@ pub fn select(target: &Target, requested: Option<&str>) -> Result<Selection, Api
             ));
         }
     }
-    let qualifies = |p: &Profile| -> bool {
-        if read_only && target.enforcement == Enforcement::DatabaseFirst {
+    let database_first = target.enforcement == Enforcement::DatabaseFirst;
+    // Whether `p` may serve `grant`: a read-only grant under `database-first`
+    // needs an exactly read-only login, otherwise the ceiling must cover it.
+    let serves = |p: &Profile, grant: &BTreeSet<&'static str>| -> bool {
+        let read_only = grant.len() == 1 && grant.contains("sql_select");
+        if read_only && database_first {
             p.ceiling.len() == 1 && p.ceiling.contains("sql_select")
         } else {
             grant.is_subset(&p.ceiling)
         }
     };
-    let chosen = candidates.iter().copied().filter(|p| qualifies(p)).min_by_key(|p| p.ceiling.len());
-    let Some(profile) = chosen else {
-        let msg = if read_only && target.enforcement == Enforcement::DatabaseFirst {
+    let mut pick: Option<(&Profile, BTreeSet<&'static str>)> = candidates
+        .iter()
+        .copied()
+        .filter(|p| serves(p, &full))
+        .min_by_key(|p| p.ceiling.len())
+        .map(|p| (p, full.clone()));
+    if pick.is_none() {
+        // Narrow: most of the grant reached first, then the smallest ceiling.
+        pick = candidates
+            .iter()
+            .copied()
+            .filter_map(|p| {
+                let eff: BTreeSet<&'static str> = full.intersection(&p.ceiling).copied().collect();
+                (!eff.is_empty() && serves(p, &eff)).then_some((p, eff))
+            })
+            .min_by_key(|(p, eff)| (std::cmp::Reverse(eff.len()), p.ceiling.len()));
+    }
+    let Some((profile, grant)) = pick else {
+        let read_only = full.len() == 1 && full.contains("sql_select");
+        let msg = if read_only && database_first {
             "this resource has no read-only SQL profile (ceiling exactly [\"sql_select\"]) for a read-only grant; \
              an administrator must add a read-only login, enable dynamic credentials, or set the resource to \
              classifier-only enforcement"
                 .to_string()
         } else {
             format!(
-                "no SQL profile's ceiling covers the caller's grant [{}]",
-                grant.iter().copied().collect::<Vec<_>>().join(", ")
+                "no SQL profile's ceiling reaches any of the caller's grant [{}]",
+                full.iter().copied().collect::<Vec<_>>().join(", ")
             )
         };
         return Err(ApiError::refused("no_profile_for_grant", msg));
     };
+    let read_only = grant.len() == 1 && grant.contains("sql_select");
+    let narrowed_out: Vec<&'static str> = full.difference(&grant).copied().collect();
     let vault_only: Vec<&'static str> = profile.ceiling.difference(&grant).copied().collect();
-    Ok(Selection { profile: profile.clone(), db_enforced: vault_only.is_empty(), grant, read_only, vault_only })
+    Ok(Selection {
+        profile: profile.clone(),
+        db_enforced: vault_only.is_empty(),
+        grant,
+        read_only,
+        vault_only,
+        narrowed_out,
+    })
 }
 
 #[cfg(test)]
@@ -388,8 +428,40 @@ pub(crate) mod tests {
             sel("database-first", &["sql_select"], standard(), Some("nope")).unwrap_err().code,
             "profile_not_found"
         );
+        // The request cannot widen or bypass: rw reaches select only, and a
+        // narrowed read-only session still needs the exact read-only login.
         let e = sel("database-first", &["sql_select", "sql_admin"], standard(), Some("rw")).unwrap_err();
         assert_eq!(e.code, "no_profile_for_grant");
+    }
+
+    #[test]
+    fn a_grant_above_every_ceiling_is_narrowed_to_the_best_profile() {
+        let ro_only = vec![profile_json("ro", &["sql_select"])];
+        // The reported case: every privilege, one read-only login, classifier-only.
+        let s = sel("classifier-only", &STATEMENT_CAPS, ro_only.clone(), None).unwrap();
+        assert_eq!(s.profile.id, "ro");
+        assert_eq!(s.grant.iter().copied().collect::<Vec<_>>(), vec!["sql_select"]);
+        assert!(s.read_only && s.db_enforced);
+        assert_eq!(s.narrowed_out.len(), STATEMENT_CAPS.len() - 1);
+        assert!(s.narrowed_out.contains(&"sql_admin") && !s.narrowed_out.contains(&"sql_select"));
+        // The same under database-first: the narrowed session is exactly read-only.
+        assert_eq!(sel("database-first", &STATEMENT_CAPS, ro_only, None).unwrap().profile.id, "ro");
+        // The profile reaching the most of the grant wins over a smaller one.
+        let s = sel("database-first", &["sql_select", "sql_update", "sql_admin"], standard()[1..].to_vec(), None);
+        let s = s.unwrap();
+        assert_eq!(s.profile.id, "rw");
+        assert_eq!(s.narrowed_out, vec!["sql_admin"]);
+        assert_eq!(s.vault_only, vec!["sql_delete", "sql_insert"]);
+        // A full cover is never narrowed.
+        assert!(sel("database-first", &STATEMENT_CAPS, standard(), None).unwrap().narrowed_out.is_empty());
+        // A login that reaches none of the grant never serves.
+        let e = sel("classifier-only", &["sql_drop"], vec![profile_json("ro", &["sql_select"])], None).unwrap_err();
+        assert_eq!(e.code, "no_profile_for_grant");
+        // Narrowing down to a read-only session under database-first still
+        // needs an exactly read-only login: rw is not enough.
+        let rw = vec![profile_json("rw", &["sql_select", "sql_insert"])];
+        let s = sel("database-first", &["sql_select", "sql_drop"], rw, None);
+        assert_eq!(s.unwrap_err().code, "no_profile_for_grant");
     }
 
     #[test]

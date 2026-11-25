@@ -158,6 +158,62 @@ pub trait Host {
     fn log(&self, level: i32, msg: &str);
 }
 
+/// A session's host view: every call goes to the inner host, but a check for
+/// a capability the session's login cannot serve (`dropped`, the part of the
+/// caller's grant above the chosen profile's ceiling) is answered "denied"
+/// whatever the host says. With `dropped` empty it changes nothing.
+pub struct ClampedHost<'a> {
+    pub inner: &'a dyn Host,
+    pub dropped: &'a [&'static str],
+}
+
+impl Host for ClampedHost<'_> {
+    fn sql_target(&self, resource: &str) -> Result<Value, HostError> {
+        self.inner.sql_target(resource)
+    }
+    fn sql_authorize(&self, resource: &str, checks: &[Check]) -> Result<Vec<Verdict>, HostError> {
+        let mut verdicts = self.inner.sql_authorize(resource, checks)?;
+        // A reply that does not line up is left for the caller's own
+        // `verdicts_match` to refuse; only matching positions are clamped.
+        for (c, v) in checks.iter().zip(verdicts.iter_mut()) {
+            if self.dropped.contains(&c.capability) {
+                v.allowed = false;
+            }
+        }
+        Ok(verdicts)
+    }
+    fn sql_credential(&self, resource: &str, profile: &str, session_ref: &str) -> Result<Credential, HostError> {
+        self.inner.sql_credential(resource, profile, session_ref)
+    }
+    fn ticket_redeem(
+        &self,
+        resource: &str,
+        profile: &str,
+        ticket: &str,
+        action: Option<&str>,
+    ) -> Result<bool, HostError> {
+        self.inner.ticket_redeem(resource, profile, ticket, action)
+    }
+    fn audit(&self, payload: Value) -> Result<(), HostError> {
+        self.inner.audit(payload)
+    }
+    fn storage_get(&self, key: &str) -> Result<Option<Vec<u8>>, HostError> {
+        self.inner.storage_get(key)
+    }
+    fn storage_put(&self, key: &str, value: &[u8]) -> Result<(), HostError> {
+        self.inner.storage_put(key, value)
+    }
+    fn storage_delete(&self, key: &str) -> Result<(), HostError> {
+        self.inner.storage_delete(key)
+    }
+    fn storage_list(&self, prefix: &str) -> Result<Vec<String>, HostError> {
+        self.inner.storage_list(prefix)
+    }
+    fn log(&self, level: i32, msg: &str) {
+        self.inner.log(level, msg)
+    }
+}
+
 /// The production host: the SDK's typed wrappers over the invocation.
 pub struct ProcessHostAdapter<'a> {
     pub inv: &'a Invocation,
@@ -238,4 +294,28 @@ impl Host for ProcessHostAdapter<'_> {
 pub fn verdicts_match(checks: &[Check], verdicts: &[Verdict]) -> bool {
     checks.len() == verdicts.len()
         && checks.iter().zip(verdicts).all(|(c, v)| c.capability == v.capability && c.target_json() == v.target)
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+    use crate::testutil::MockHost;
+    use serde_json::json;
+
+    #[test]
+    fn a_clamped_host_denies_only_the_dropped_capabilities() {
+        let inner = MockHost::new(json!({}));
+        let dropped = ["sql_drop"];
+        let h = ClampedHost { inner: &*inner, dropped: &dropped };
+        let checks = [Check::server("sql_select"), Check::server("sql_drop"), Check::object("sql_drop", "a", "b", "c")];
+        let v = h.sql_authorize("db", &checks).unwrap();
+        assert_eq!(v.len(), 3, "one verdict per check, in order");
+        let allowed: Vec<bool> = v.iter().map(|v| v.allowed).collect();
+        let inner_says: Vec<bool> = inner.sql_authorize("db", &checks).unwrap().iter().map(|v| v.allowed).collect();
+        assert_eq!(allowed[0], inner_says[0], "an undropped capability follows the host");
+        assert_eq!(&allowed[1..], &[false, false], "a dropped one is denied at server and object level");
+        let none = ClampedHost { inner: &*inner, dropped: &[] };
+        let same: Vec<bool> = none.sql_authorize("db", &checks).unwrap().iter().map(|v| v.allowed).collect();
+        assert_eq!(same, inner_says, "an empty drop set is transparent");
+    }
 }

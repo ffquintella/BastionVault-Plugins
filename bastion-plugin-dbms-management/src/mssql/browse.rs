@@ -284,8 +284,15 @@ pub fn apply(
     ev["op"] = json!(edit.op.as_str());
     ev["key_hmac"] = json!(key_hmac);
     ev["columns"] = json!(edit.changed_columns());
-    let authorized =
-        authorize_edit(cx.host, &s.resource, &s.id, edit.op.capability(), (&cat, &cschema, &ctable), sql, params)?;
+    let authorized = authorize_edit(
+        &s.clamp(cx.host),
+        &s.resource,
+        &s.id,
+        edit.op.capability(),
+        (&cat, &cschema, &ctable),
+        sql,
+        params,
+    )?;
     let edit_auth = match authorized {
         Ok(a) => a,
         Err(verdicts) => {

@@ -41,6 +41,9 @@ pub struct SessionInfo {
     pub grant: Vec<&'static str>,
     pub ceiling: Vec<&'static str>,
     pub vault_only: Vec<&'static str>,
+    /// The caller's capabilities above the profile's ceiling: refused by
+    /// every authorization of this session (see `host::ClampedHost`).
+    pub narrowed_out: Vec<&'static str>,
     pub tls_mode: TlsMode,
     /// The database itself enforces read-only transactions, and the server
     /// reports the setting so a change is seen (§5.3, Phase 2 obligation).
@@ -88,6 +91,11 @@ pub struct Session {
 }
 
 impl Session {
+    /// `host` as this session may use it: checks for capabilities above the
+    /// profile's ceiling are denied.
+    pub fn clamp<'a>(&'a self, host: &'a dyn Host) -> crate::host::ClampedHost<'a> {
+        crate::host::ClampedHost { inner: host, dropped: &self.info.narrowed_out }
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -127,6 +135,7 @@ impl Session {
             "privileges": self.info.grant,
             "ceiling": self.info.ceiling,
             "vault_only": self.info.vault_only,
+            "narrowed_out": self.info.narrowed_out,
             "transport": "direct",
             "tls_mode": self.info.tls_mode.as_str(),
             "search_path": st.ctx.search_path,
@@ -487,6 +496,7 @@ fn open_reserved(
         grant: selection.grant.iter().copied().collect(),
         ceiling: p.ceiling.iter().copied().collect(),
         vault_only: selection.vault_only.clone(),
+        narrowed_out: selection.narrowed_out.clone(),
         tls_mode: p.tls.mode,
         database_read_only,
         step_up: p.step_up.clone(),
@@ -686,7 +696,7 @@ pub fn execute(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Va
             .block_on(s.conn.resolve(&refs))
             .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
     };
-    let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Execute)?;
+    let (decision, minted) = authz::authorize(&s.clamp(cx.host), &s.resource, &s.id, prepared, &res, Mode::Execute)?;
     let Some(stmts) = minted else {
         audit_refused_statements(cx, s, &decision, &digest);
         return Ok(json!({"state": "refused", "message": decision.message(), "statements": decision.report()}));
@@ -939,7 +949,7 @@ pub fn script(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
             .block_on(s.conn.resolve(&refs))
             .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
     };
-    let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Script)?;
+    let (decision, minted) = authz::authorize(&s.clamp(cx.host), &s.resource, &s.id, prepared, &res, Mode::Script)?;
     let Some(stmts) = minted else {
         audit_refused_statements(cx, s, &decision, &digest);
         let first = decision.statements.iter().find(|(_, v)| v.iter().any(|x| !x.allowed)).map(|(m, _)| m.index);
@@ -1144,7 +1154,7 @@ pub fn export(cx: &Ctx<'_>, s: &Arc<Session>, data: &serde_json::Map<String, Val
             .block_on(s.conn.resolve(&refs))
             .map_err(|e| ApiError::refused("name_resolution", format!("resolving names: {}", e.message)))?
     };
-    let (decision, minted) = authz::authorize(cx.host, &s.resource, &s.id, prepared, &res, Mode::Export)?;
+    let (decision, minted) = authz::authorize(&s.clamp(cx.host), &s.resource, &s.id, prepared, &res, Mode::Export)?;
     let Some(mut stmts) = minted else {
         audit_refused_statements(cx, s, &decision, &digest);
         refused(ev, "refused_statement");
