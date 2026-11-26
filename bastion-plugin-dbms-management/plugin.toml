@@ -5,7 +5,7 @@
 # releases (`resource_sql_credential`) and audited with a host-stamped actor.
 
 name        = "dbms-management"
-version     = "0.1.0"
+version     = "0.1.1"
 plugin_type = "sql-browser"
 runtime     = "process"
 abi_version = "1.4"
